@@ -152,30 +152,45 @@ begin
   SQL
   puts plan_full_view
 
-  puts "\n--- 3e. Payee validation & batch VALUES lookup plan inside post_bulk_payments (100-item batch) ---"
+  puts "\n--- 3e. Static MERGE ... ON FALSE ... RETURNING plan inside post_bulk_payments (100-item batch) ---"
   sample_payees_100 = payee_pool.first(100)
   sample_amounts_100 = Array.new(100, 125)
   sample_descs_100 = Array.new(100) { |i| "Explain batch item ##{i}" }
 
-  plan_join_100 = admin_conn.exec_params(<<~SQL, [ "{#{sample_payees_100.join(',')}}", "{#{sample_amounts_100.join(',')}}", "{#{sample_descs_100.map { |s| "\"#{s}\"" }.join(',')}}" ]).map { |r| r["QUERY PLAN"] }.join("\n")
-    EXPLAIN (ANALYZE, BUFFERS)
-    SELECT resolved.payee_id, u.amount_cents, u.description, u.ord
-    FROM ROWS FROM (
-      pg_catalog.unnest($1::uuid[]),
-      pg_catalog.unnest($2::int4[]),
-      pg_catalog.unnest($3::text[])
-    ) WITH ORDINALITY AS u(payee_uuid, amount_cents, description, ord)
-    JOIN (
-      SELECT d.payee_uuid, fd.id AS payee_id
-      FROM (
-        SELECT DISTINCT items.payee_uuid
-        FROM pg_catalog.unnest($1::uuid[]) AS items(payee_uuid)
-      ) AS d
-      JOIN public.firm_descriptions AS fd ON fd.uuid = d.payee_uuid
-    ) AS resolved ON resolved.payee_uuid = u.payee_uuid
-    ORDER BY u.ord
-  SQL
-  puts plan_join_100
+  admin_conn.exec("BEGIN ISOLATION LEVEL READ COMMITTED")
+  plan_merge_100 = admin_conn.exec_params(
+    <<~SQL,
+      EXPLAIN (ANALYZE, BUFFERS)
+      WITH inserted AS (
+        MERGE INTO public.payments AS p
+        USING (
+          SELECT
+            fd.id AS payee_id,
+            u.amount_cents,
+            u.description,
+            u.ord
+          FROM unnest($2::uuid[], $3::int4[], $4::text[]) WITH ORDINALITY
+            AS u(payee_uuid, amount_cents, description, ord)
+          JOIN public.firm_descriptions AS fd ON fd.uuid = u.payee_uuid
+        ) AS src
+        ON FALSE
+        WHEN NOT MATCHED THEN
+          INSERT (payer_firm_id, payee_firm_id, amount_cents, description)
+          VALUES ($1::bigint, src.payee_id, src.amount_cents, src.description)
+        RETURNING p.id, src.ord
+      )
+      SELECT COALESCE(pg_catalog.array_agg(inserted.id ORDER BY inserted.ord), ARRAY[]::bigint[])
+      FROM inserted
+    SQL
+    [
+      normal_firm_id,
+      "{#{sample_payees_100.join(',')}}",
+      "{#{sample_amounts_100.join(',')}}",
+      "{#{sample_descs_100.map { |s| "\"#{s}\"" }.join(',')}}"
+    ]
+  ).map { |r| r["QUERY PLAN"] }.join("\n")
+  admin_conn.exec("ROLLBACK")
+  puts plan_merge_100
 
   puts "\n--- 3f. Full post_bulk_payments(...) execution plan (100-item batch) ---"
   admin_conn.exec("BEGIN ISOLATION LEVEL READ COMMITTED")

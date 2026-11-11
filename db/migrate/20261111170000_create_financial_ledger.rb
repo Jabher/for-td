@@ -7,7 +7,8 @@
 # 1. `public.post_bulk_payments`: `VOLATILE SECURITY DEFINER` owned by `ledger_definer` (`NOLOGIN`)
 #    with fixed `search_path = pg_catalog, pg_temp`. Independently re-verifies writable
 #    `READ COMMITTED` isolation, array/item bounds, self-payment prohibition, sender-only
-#    `FOR NO KEY UPDATE` serialization, separate-statement `NUMERIC` balance check, and atomic batch `INSERT`.
+#    `FOR NO KEY UPDATE` serialization, separate-statement `NUMERIC` balance check, and static
+#    `MERGE ... ON FALSE ... RETURNING` batch insertion ordered by source ordinality.
 # 2. Table `CHECK` & `ON UPDATE/DELETE RESTRICT` `FOREIGN KEY` constraints on `firm_descriptions` and `payments`.
 # 3. `BEFORE UPDATE/DELETE/TRUNCATE` triggers enforcing append-only `payments` and immutable firm columns.
 # 4. Least-privilege grants (`apply_ledger_security`) restricting `ledger_runtime` to `INSERT` +
@@ -130,8 +131,8 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
       FOR EACH STATEMENT
       EXECUTE FUNCTION public.guard_firm_descriptions_immutability();
 
-      -- Grouped subqueries allow PG 18 to push `WHERE id = $1` into two Index-Only Scans
-      -- for single-firm reads while executing Parallel HashAggregates on full-view scans.
+      -- Correlated scalar aggregates bind `fd.id` directly into the covering `(payee_firm_id)` /
+      -- `(payer_firm_id)` Index-Only Scans without materializing or grouping unrelated firms.
       CREATE VIEW public.firms AS
       SELECT
         fd.id,
@@ -139,24 +140,24 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
         fd.name,
         (
           fd.opening_balance_cents::pg_catalog.numeric
-          + COALESCE(incoming.total_cents, 0::pg_catalog.numeric)
-          - COALESCE(outgoing.total_cents, 0::pg_catalog.numeric)
+          + COALESCE(
+            (
+              SELECT SUM(p_in.amount_cents::pg_catalog.numeric)
+              FROM public.payments AS p_in
+              WHERE p_in.payee_firm_id = fd.id
+            ),
+            0::pg_catalog.numeric
+          )
+          - COALESCE(
+            (
+              SELECT SUM(p_out.amount_cents::pg_catalog.numeric)
+              FROM public.payments AS p_out
+              WHERE p_out.payer_firm_id = fd.id
+            ),
+            0::pg_catalog.numeric
+          )
         ) AS balance_cents
-      FROM public.firm_descriptions AS fd
-      LEFT JOIN (
-        SELECT
-          p_in.payee_firm_id AS firm_id,
-          SUM(p_in.amount_cents::pg_catalog.numeric) AS total_cents
-        FROM public.payments AS p_in
-        GROUP BY p_in.payee_firm_id
-      ) AS incoming ON incoming.firm_id = fd.id
-      LEFT JOIN (
-        SELECT
-          p_out.payer_firm_id AS firm_id,
-          SUM(p_out.amount_cents::pg_catalog.numeric) AS total_cents
-        FROM public.payments AS p_out
-        GROUP BY p_out.payer_firm_id
-      ) AS outgoing ON outgoing.firm_id = fd.id;
+      FROM public.firm_descriptions AS fd;
 
       CREATE OR REPLACE FUNCTION public.post_bulk_payments(
         p_payer_uuid UUID,
@@ -179,7 +180,6 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
         v_gross_total NUMERIC;
         v_bad_ord BIGINT;
         v_bad_uuid UUID;
-        v_insert_sql TEXT;
         v_inserted_ids BIGINT[];
       BEGIN
         -- `REPEATABLE READ` / `SERIALIZABLE` would read a transaction-start snapshot instead of
@@ -385,37 +385,33 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
             HINT = 'Reduce the total requested payment amount or wait for incoming funds before retrying.';
         END IF;
 
-        -- Dynamic `VALUES (...), ...` preserves the explicit multi-tuple `INSERT ... VALUES` contract
-        -- for arbitrary 1..1000 batch sizes while safely quoting every literal via `%L`.
-        SELECT
-          'WITH inserted AS (INSERT INTO public.payments (payer_firm_id, payee_firm_id, amount_cents, description) VALUES ' ||
-          pg_catalog.string_agg(
-            pg_catalog.format(
-              '(%L::bigint, %L::bigint, %L::integer, %L::text)',
-              v_payer_id,
-              resolved.payee_id,
+        -- PG 17+ `MERGE ... ON FALSE ... RETURNING`: unlike `INSERT ... SELECT ... RETURNING`,
+        -- `MERGE RETURNING` exposes `src` columns (`src.ord`) alongside generated `p.id` in one
+        -- static plan-cached SQL statement (no dynamic SQL). `array_agg(inserted.id ORDER BY inserted.ord)`
+        -- decouples returned IDs from `USING`-join execution/ID-allocation order and bare `array_agg()`'s
+        -- unspecified input order. Multi-arg `unnest(...)` is a SQL grammar construct expanding internally
+        -- to `ROWS FROM (...)` and cannot carry a schema prefix.
+        WITH inserted AS (
+          MERGE INTO public.payments AS p
+          USING (
+            SELECT
+              fd.id AS payee_id,
               u.amount_cents,
-              u.description
-            ),
-            ', ' ORDER BY u.ord
-          ) ||
-          ' RETURNING id) SELECT COALESCE(pg_catalog.array_agg(id), ARRAY[]::bigint[]) FROM inserted'
-        INTO STRICT v_insert_sql
-        FROM ROWS FROM (
-          pg_catalog.unnest(p_payee_uuids),
-          pg_catalog.unnest(p_amounts_cents),
-          pg_catalog.unnest(p_descriptions)
-        ) WITH ORDINALITY AS u(payee_uuid, amount_cents, description, ord)
-        JOIN (
-          SELECT d.payee_uuid, fd.id AS payee_id
-          FROM (
-            SELECT DISTINCT items.payee_uuid
-            FROM pg_catalog.unnest(p_payee_uuids) AS items(payee_uuid)
-          ) AS d
-          JOIN public.firm_descriptions AS fd ON fd.uuid = d.payee_uuid
-        ) AS resolved ON resolved.payee_uuid = u.payee_uuid;
-
-        EXECUTE v_insert_sql INTO STRICT v_inserted_ids;
+              u.description,
+              u.ord
+            FROM unnest(p_payee_uuids, p_amounts_cents, p_descriptions) WITH ORDINALITY
+              AS u(payee_uuid, amount_cents, description, ord)
+            JOIN public.firm_descriptions AS fd ON fd.uuid = u.payee_uuid
+          ) AS src
+          ON FALSE
+          WHEN NOT MATCHED THEN
+            INSERT (payer_firm_id, payee_firm_id, amount_cents, description)
+            VALUES (v_payer_id, src.payee_id, src.amount_cents, src.description)
+          RETURNING p.id, src.ord
+        )
+        SELECT COALESCE(pg_catalog.array_agg(inserted.id ORDER BY inserted.ord), ARRAY[]::bigint[])
+        INTO STRICT v_inserted_ids
+        FROM inserted;
 
         IF COALESCE(pg_catalog.cardinality(v_inserted_ids), 0) <> v_batch_size THEN
           RAISE EXCEPTION USING

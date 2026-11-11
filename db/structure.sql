@@ -27,7 +27,6 @@ BEGIN
     CREATE ROLE ledger_runtime LOGIN PASSWORD 'ledger_runtime_secret' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
   END IF;
 
-  -- Transfer object ownership to dedicated non-login SECURITY DEFINER owner role.
   ALTER TABLE public.firm_descriptions OWNER TO ledger_definer;
   ALTER TABLE public.payments OWNER TO ledger_definer;
   ALTER VIEW public.firms OWNER TO ledger_definer;
@@ -35,11 +34,9 @@ BEGIN
   ALTER FUNCTION public.guard_payments_immutability() OWNER TO ledger_definer;
   ALTER FUNCTION public.post_bulk_payments(UUID, UUID[], INTEGER[], TEXT[]) OWNER TO ledger_definer;
 
-  -- Lock down schema creation from PUBLIC and runtime role.
   REVOKE CREATE ON SCHEMA public FROM PUBLIC, ledger_runtime;
   GRANT USAGE ON SCHEMA public TO ledger_definer, ledger_runtime;
 
-  -- Revoke all default table/view/sequence/function privileges.
   REVOKE ALL ON TABLE public.firm_descriptions FROM PUBLIC, ledger_runtime;
   REVOKE ALL ON TABLE public.payments FROM PUBLIC, ledger_runtime;
   REVOKE ALL ON TABLE public.firms FROM PUBLIC, ledger_runtime;
@@ -49,11 +46,6 @@ BEGIN
   REVOKE ALL ON FUNCTION public.guard_payments_immutability() FROM PUBLIC, ledger_runtime;
   REVOKE ALL ON FUNCTION public.post_bulk_payments(UUID, UUID[], INTEGER[], TEXT[]) FROM PUBLIC, ledger_runtime;
 
-  -- Grant ledger_runtime ONLY:
-  -- 1) Read access needed for firm operations (firm_descriptions and read-only firms view)
-  -- 2) Creating firms with initial opening_balance_cents (uuid, name, opening_balance_cents)
-  -- 3) Column-level UPDATE(name) on firm_descriptions (never id, uuid, opening_balance_cents, timestamps)
-  -- 4) EXECUTE on post_bulk_payments
   GRANT SELECT (id, uuid, name, opening_balance_cents, created_at, updated_at)
     ON TABLE public.firm_descriptions TO ledger_runtime;
   GRANT INSERT (uuid, name, opening_balance_cents)
@@ -147,10 +139,10 @@ DECLARE
   v_gross_total NUMERIC;
   v_bad_ord BIGINT;
   v_bad_uuid UUID;
-  v_insert_sql TEXT;
   v_inserted_ids BIGINT[];
 BEGIN
-  -- Enforce caller transaction contract: writable READ COMMITTED transaction.
+  -- `REPEATABLE READ` / `SERIALIZABLE` would read a transaction-start snapshot instead of
+  -- post-lock committed credits; `READ COMMITTED` is mandatory for lock-then-balance correctness.
   v_isolation := pg_catalog.current_setting('transaction_isolation');
   IF v_isolation <> 'read committed' THEN
     RAISE EXCEPTION USING
@@ -169,7 +161,8 @@ BEGIN
       HINT = 'Start a read-write READ COMMITTED transaction before calling post_bulk_payments.';
   END IF;
 
-  -- Validate function arguments independently of HTTP validation.
+  -- Database safeguard guards: re-enforce every input invariant independently of Ruby Layer 1
+  -- so direct SQL callers or future service paths cannot bypass batch/item validation.
   IF p_payer_uuid IS NULL THEN
     RAISE EXCEPTION USING
       ERRCODE = '22004',
@@ -218,7 +211,6 @@ BEGIN
       HINT = 'Submit between 1 and 1000 payment items per request.';
   END IF;
 
-  -- Check per-item argument invariants (non-null payee, strictly positive amount_cents, non-blank description, no self-payment).
   SELECT u.ord
   INTO v_bad_ord
   FROM ROWS FROM (
@@ -289,8 +281,8 @@ BEGIN
       HINT = 'Ensure every payee_firm_uuid differs from payer_firm_uuid.';
   END IF;
 
-  -- Step 1: Serialize spending by this sender using the REAL metadata row.
-  -- Do NOT lock recipient firm rows; lock is held until the caller commits or rolls back.
+  -- Sender-only serialization law: lock ONLY the sender's `firm_descriptions` row (`FOR NO KEY UPDATE`),
+  -- never recipients. Incoming transfers take only FK `FOR KEY SHARE`, preventing cross-firm deadlocks.
   BEGIN
     SELECT fd.id INTO STRICT v_payer_id
     FROM public.firm_descriptions AS fd
@@ -305,17 +297,18 @@ BEGIN
         HINT = 'Verify payer_firm_uuid refers to an existing firm.';
   END;
 
-  -- Step 2: After acquiring the sender lock, read the derived balance in a separate command.
+  -- Separate-statement balance law: under `READ COMMITTED`, a new SQL command acquires a fresh
+  -- snapshot AFTER `FOR NO KEY UPDATE` grants, observing all transfers committed while waiting.
+  -- Combining lock + sum in one query would evaluate against a pre-lock snapshot and overdraft!
   SELECT f.balance_cents INTO STRICT v_balance
   FROM public.firms AS f
   WHERE f.id = v_payer_id;
 
-  -- Compute exact NUMERIC gross batch total by casting each amount before summation.
   SELECT SUM(u.amount_cents::pg_catalog.numeric)
   INTO STRICT v_gross_total
   FROM pg_catalog.unnest(p_amounts_cents) AS u(amount_cents);
 
-  -- Verify all payee firms exist (read-only lookup, no row locks acquired on recipients).
+  -- Read-only payee existence check (acquires zero row locks on recipients).
   SELECT u.ord, u.payee_uuid
   INTO v_bad_ord, v_bad_uuid
   FROM (
@@ -338,7 +331,6 @@ BEGIN
       HINT = 'Ensure every payee_firm_uuid refers to an existing firm.';
   END IF;
 
-  -- Step 3: Reject if balance < full outgoing total.
   IF v_balance < v_gross_total THEN
     RAISE EXCEPTION USING
       ERRCODE = 'P0001',
@@ -352,36 +344,33 @@ BEGIN
       HINT = 'Reduce the total requested payment amount or wait for incoming funds before retrying.';
   END IF;
 
-  -- Step 4: Persist every requested payment atomically in batch order using VALUES (...), (...), ...
-  SELECT
-    'WITH inserted AS (INSERT INTO public.payments (payer_firm_id, payee_firm_id, amount_cents, description) VALUES ' ||
-    pg_catalog.string_agg(
-      pg_catalog.format(
-        '(%L::bigint, %L::bigint, %L::integer, %L::text)',
-        v_payer_id,
-        resolved.payee_id,
+  -- PG 17+ `MERGE ... ON FALSE ... RETURNING`: unlike `INSERT ... SELECT ... RETURNING`,
+  -- `MERGE RETURNING` exposes `src` columns (`src.ord`) alongside generated `p.id` in one
+  -- static plan-cached SQL statement (no dynamic SQL). `array_agg(inserted.id ORDER BY inserted.ord)`
+  -- decouples returned IDs from `USING`-join execution/ID-allocation order and bare `array_agg()`'s
+  -- unspecified input order. Multi-arg `unnest(...)` is a SQL grammar construct expanding internally
+  -- to `ROWS FROM (...)` and cannot carry a schema prefix.
+  WITH inserted AS (
+    MERGE INTO public.payments AS p
+    USING (
+      SELECT
+        fd.id AS payee_id,
         u.amount_cents,
-        u.description
-      ),
-      ', ' ORDER BY u.ord
-    ) ||
-    ' RETURNING id) SELECT COALESCE(pg_catalog.array_agg(id), ARRAY[]::bigint[]) FROM inserted'
-  INTO STRICT v_insert_sql
-  FROM ROWS FROM (
-    pg_catalog.unnest(p_payee_uuids),
-    pg_catalog.unnest(p_amounts_cents),
-    pg_catalog.unnest(p_descriptions)
-  ) WITH ORDINALITY AS u(payee_uuid, amount_cents, description, ord)
-  JOIN (
-    SELECT d.payee_uuid, fd.id AS payee_id
-    FROM (
-      SELECT DISTINCT items.payee_uuid
-      FROM pg_catalog.unnest(p_payee_uuids) AS items(payee_uuid)
-    ) AS d
-    JOIN public.firm_descriptions AS fd ON fd.uuid = d.payee_uuid
-  ) AS resolved ON resolved.payee_uuid = u.payee_uuid;
-
-  EXECUTE v_insert_sql INTO STRICT v_inserted_ids;
+        u.description,
+        u.ord
+      FROM unnest(p_payee_uuids, p_amounts_cents, p_descriptions) WITH ORDINALITY
+        AS u(payee_uuid, amount_cents, description, ord)
+      JOIN public.firm_descriptions AS fd ON fd.uuid = u.payee_uuid
+    ) AS src
+    ON FALSE
+    WHEN NOT MATCHED THEN
+      INSERT (payer_firm_id, payee_firm_id, amount_cents, description)
+      VALUES (v_payer_id, src.payee_id, src.amount_cents, src.description)
+    RETURNING p.id, src.ord
+  )
+  SELECT COALESCE(pg_catalog.array_agg(inserted.id ORDER BY inserted.ord), ARRAY[]::bigint[])
+  INTO STRICT v_inserted_ids
+  FROM inserted;
 
   IF COALESCE(pg_catalog.cardinality(v_inserted_ids), 0) <> v_batch_size THEN
     RAISE EXCEPTION USING
@@ -466,19 +455,15 @@ CREATE TABLE public.payments (
 --
 
 CREATE VIEW public.firms AS
- SELECT fd.id,
-    fd.uuid,
-    fd.name,
-    (((fd.opening_balance_cents)::numeric + COALESCE(incoming.total_cents, (0)::numeric)) - COALESCE(outgoing.total_cents, (0)::numeric)) AS balance_cents
-   FROM ((public.firm_descriptions fd
-     LEFT JOIN ( SELECT p_in.payee_firm_id AS firm_id,
-            sum((p_in.amount_cents)::numeric) AS total_cents
+ SELECT id,
+    uuid,
+    name,
+    (((opening_balance_cents)::numeric + COALESCE(( SELECT sum((p_in.amount_cents)::numeric) AS sum
            FROM public.payments p_in
-          GROUP BY p_in.payee_firm_id) incoming ON ((incoming.firm_id = fd.id)))
-     LEFT JOIN ( SELECT p_out.payer_firm_id AS firm_id,
-            sum((p_out.amount_cents)::numeric) AS total_cents
+          WHERE (p_in.payee_firm_id = fd.id)), (0)::numeric)) - COALESCE(( SELECT sum((p_out.amount_cents)::numeric) AS sum
            FROM public.payments p_out
-          GROUP BY p_out.payer_firm_id) outgoing ON ((outgoing.firm_id = fd.id)));
+          WHERE (p_out.payer_firm_id = fd.id)), (0)::numeric)) AS balance_cents
+   FROM public.firm_descriptions fd;
 
 
 --

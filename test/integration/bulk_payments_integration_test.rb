@@ -51,13 +51,39 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
     assert_equal 1_305_050, firm_balance_cents(PAYEE1_UUID)
     assert_equal 120_075, firm_balance_cents(PAYEE2_UUID)
 
-    rows = fetch_all_payments
-    assert_equal [ 625_000, 580_050, 120_075 ], rows.map { |r| r[:amount_cents] }
+    by_id = fetch_all_payments.index_by { |r| r[:id] }
+    ordered_rows = body["payment_ids"].map { |id| by_id.fetch(id) }
+    assert_equal 3, by_id.size
+    assert_equal [ 625_000, 580_050, 120_075 ], ordered_rows.map { |r| r[:amount_cents] }
     assert_equal [
       "Overflow returns, August 2026",
       "Amended returns, August 2026",
       "Bookkeeping cleanup, 3 clients"
-    ], rows.map { |r| r[:description] }
+    ], ordered_rows.map { |r| r[:description] }
+  end
+
+  test "returns payment_ids strictly ordered by source payment index regardless of payee join order" do
+    firm_early = create_firm!(name: "Early ID Payee", opening_balance_cents: 0)
+    firm_late  = create_firm!(name: "Late ID Payee", opening_balance_cents: 0)
+
+    # Reverse and interleave payee IDs (`firm_late` -> `@payee2` -> `firm_early` -> `firm_late` -> `@payee1`)
+    # so any hash/index join reordering without `ORDER BY inserted.ord` would scramble `payment_ids`.
+    legs = [
+      { amount: "1.01", payee_firm_uuid: firm_late.uuid, description: "Ord 0" },
+      { amount: "2.02", payee_firm_uuid: PAYEE2_UUID, description: "Ord 1" },
+      { amount: "3.03", payee_firm_uuid: firm_early.uuid, description: "Ord 2" },
+      { amount: "4.04", payee_firm_uuid: firm_late.uuid, description: "Ord 3" },
+      { amount: "5.05", payee_firm_uuid: PAYEE1_UUID, description: "Ord 4" }
+    ]
+
+    post_json(payer_firm_uuid: PAYER_UUID, payments: legs)
+    assert_response :created
+
+    returned_ids = JSON.parse(response.body)["payment_ids"]
+    by_id = fetch_all_payments.index_by { |r| r[:id] }
+
+    assert_equal [ "Ord 0", "Ord 1", "Ord 2", "Ord 3", "Ord 4" ], returned_ids.map { |id| by_id.fetch(id)[:description] }
+    assert_equal [ 101, 202, 303, 404, 505 ], returned_ids.map { |id| by_id.fetch(id)[:amount_cents] }
   end
 
   test "preserves fully identical transfers in the same batch as separate payment rows" do
@@ -116,9 +142,11 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
     )
 
     assert_response :created
-    rows = fetch_all_payments
-    assert_equal expected_cents, rows.map { |r| r[:amount_cents] }
-    assert_equal "Valid format 0 ", rows.first[:description]
+    returned_ids = JSON.parse(response.body)["payment_ids"]
+    by_id = fetch_all_payments.index_by { |r| r[:id] }
+    ordered_rows = returned_ids.map { |id| by_id.fetch(id) }
+    assert_equal expected_cents, ordered_rows.map { |r| r[:amount_cents] }
+    assert_equal "Valid format 0 ", ordered_rows.first[:description]
   end
 
   test "accepts exact single-payment PG INTEGER max (21474836.47) and batch total exceeding int4 max" do

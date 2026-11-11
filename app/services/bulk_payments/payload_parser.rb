@@ -1,10 +1,17 @@
 # frozen_string_literal: true
 
 module BulkPayments
-  # Validates the exact HTTP JSON contract for POST /bulk_payments and converts
-  # USD string amounts into exact integer cents without floating point or rounding.
+  # Layer 1 — Service Shortcut Guard (Zero-DB Boundary).
   #
-  # Note: HTTP Idempotency-Key support is intentionally out of scope for this service.
+  # Enforces every stateless HTTP/JSON invariant in memory (UTF-8 & RFC 8259 JSON syntax,
+  # strict object shape, 1..1000 batch bounds, UUID syntax, exact USD string-to-int4-cent
+  # conversion without floats, non-blank descriptions, and payer != payee self-payment
+  # rejection) as an early shortcut so malformed or invalid requests never lease a
+  # connection, acquire locks, or touch PostgreSQL.
+  #
+  # PostgreSQL mirrors these invariants independently as Layer 2 safeguards inside
+  # `public.post_bulk_payments`, table constraints, triggers, and role ACLs
+  # (see `CreateFinancialLedger` and `BulkPayments::Poster`).
   class PayloadParser
     UUID_PATTERN = /\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z/
     USD_AMOUNT_PATTERN = /\A(?:0|[1-9][0-9]*)(?:\.[0-9]{1,2})?\z/
@@ -31,11 +38,14 @@ module BulkPayments
         raw_payments.each_with_index do |item, index|
           validate_payment_object!(item, index)
 
-          payee_uuids[index] = parse_uuid!(
+          payee_uuid = parse_uuid!(
             item["payee_firm_uuid"],
             field: "payments[#{index}].payee_firm_uuid",
             payment_index: index
           )
+          reject_self_payment!(payer_uuid, payee_uuid, index)
+
+          payee_uuids[index] = payee_uuid
           amounts_cents[index] = parse_amount_cents!(item["amount"], index)
           descriptions[index] = parse_description!(item["description"], index)
         end
@@ -191,6 +201,19 @@ module BulkPayments
           end
 
           value.downcase
+        end
+
+        def reject_self_payment!(payer_uuid, payee_uuid, index)
+          return unless payee_uuid == payer_uuid
+
+          raise Error.new(
+            code: "self_payment",
+            what: "Self-payment is not permitted (payment at index #{index} targets payer firm #{payer_uuid}).",
+            why: "A firm cannot transfer funds to itself; payer_firm_uuid and payee_firm_uuid must refer to distinct firms.",
+            how_to_fix: "Ensure payments[#{index}].payee_firm_uuid differs from payer_firm_uuid.",
+            field: "payments[#{index}].payee_firm_uuid",
+            payment_index: index
+          )
         end
 
         def parse_amount_cents!(value, index)

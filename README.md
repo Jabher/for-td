@@ -79,3 +79,9 @@ Every `422` response returns a stable JSON structure explaining **what** failed,
 - **`public.firms`**: Read-only view deriving exact `NUMERIC` `balance_cents` from `opening_balance_cents + incoming - outgoing` with zero stored snapshots or triggers updating balances.
 - **`public.post_bulk_payments(...)`**: `VOLATILE` `SECURITY DEFINER` PL/pgSQL function owned by `ledger_definer` with `SET search_path = pg_catalog, pg_temp`. Enforces `READ COMMITTED`, acquires `FOR NO KEY UPDATE` exclusively on the sender row in `firm_descriptions`, reads the fresh derived `NUMERIC` balance from `firms` in a separate SQL command, validates all accounting invariants, and atomically inserts the entire batch.
 - **Least-Privilege Runtime Role (`ledger_runtime`)**: Can `INSERT (uuid, name, opening_balance_cents)` and `UPDATE (name)` on `firm_descriptions`, `SELECT` on `firm_descriptions` and `firms`, and `EXECUTE` `post_bulk_payments`. Cannot read or write `payments` directly, cannot update `id`/`uuid`/`opening_balance_cents`, cannot delete rows, and cannot alter database objects.
+
+## Agent Skills Included in Repository
+
+- [`skills/errors-as-doors/`](skills/errors-as-doors/SKILL.md) (with [cross-domain research consolidation](skills/errors-as-doors/references/errors-as-doors-cross-domain-2026-05-30.md)): educational boundary rejection design (`fact -> reason -> action` doors).
+- [`skills/comments/`](skills/comments/SKILL.md) (with [adjudicated stance & schools](skills/comments/references/schools.md)): existence test for code comments, file preambles, and named laws.
+- Registered for automatic workspace discovery via [`.agents/skills.json`](.agents/skills.json).

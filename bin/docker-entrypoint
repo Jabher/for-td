@@ -1,7 +1,7 @@
 #!/bin/bash -e
 
-# If running the rails server then create or migrate existing database using
-# the migration admin role, then exec the server under the restricted runtime role.
+# Scope `DB_ROLE=admin` strictly to the `db:prepare` subprocess so `exec "${@}"`
+# boots Puma under the least-privilege `ledger_runtime` role (`config/database.yml`).
 if [ "${@: -2:1}" == "./bin/rails" ] && [ "${@: -1:1}" == "server" ]; then
   DB_ROLE=admin ./bin/rails db:prepare
 fi

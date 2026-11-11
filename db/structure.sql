@@ -610,7 +610,6 @@ SET search_path TO "$user", public;
 INSERT INTO "schema_migrations" (version) VALUES
 ('20261111170000');
 
--- Restore SECURITY DEFINER ownership and least-privilege runtime grants
 SELECT public.apply_ledger_security();
 REVOKE ALL ON FUNCTION public.apply_ledger_security() FROM PUBLIC, ledger_runtime;
 

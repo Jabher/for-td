@@ -1,9 +1,9 @@
 # frozen_string_literal: true
 
+# Boundary rejection contract (`errors-as-doors` pattern; see `skills/errors-as-doors/SKILL.md`).
+# Rescued by `ApplicationController#render_domain_error` as HTTP 422 JSON (`fact -> reason -> action`).
+# Never used for unhandled internal faults, which fall through to a generic HTTP 500 response.
 module BulkPayments
-  # Structured domain error implementing the "errors-as-doors" pattern:
-  # every error carries a stable `code`, `what` went wrong, `why` it was rejected,
-  # and `how_to_fix` it, plus optional `field` / `payment_index` pointers.
   class Error < StandardError
     attr_reader :code, :what, :why, :how_to_fix, :field, :payment_index
 

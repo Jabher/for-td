@@ -1,12 +1,17 @@
 # frozen_string_literal: true
 
 module BulkPayments
-  # Executes bulk payment postings inside a single READ COMMITTED PostgreSQL transaction
-  # using bound parameters against `public.post_bulk_payments(...)`.
+  # Transaction bridge to Layer 2 (`public.post_bulk_payments`; see `BulkPayments::PayloadParser`
+  # for Layer 1 shortcut guards and `CreateFinancialLedger` for Layer 2 database safeguards).
   #
-  # All accounting invariants (sender row locking, derived balance reading, gross sum
-  # verification, firm existence checks, self-payment rejection, and atomic insert)
-  # live exclusively inside the PostgreSQL function.
+  # Zero accounting math or locking lives in Ruby:
+  # - Opens a top-level `READ COMMITTED` transaction (`requires_new: false, joinable: false`
+  #   because PostgreSQL rejects `ISOLATION LEVEL` inside a `SAVEPOINT` and the sender's
+  #   `FOR NO KEY UPDATE` lock must be held until top-level commit/rollback).
+  # - Passes bound typed arrays (`uuid[]`, `int4[]`, `text[]`) on a single connection.
+  # - Translates PostgreSQL domain/safeguard exceptions (`DETAIL` / `MESSAGE` / `HINT`) into
+  #   `BulkPayments::Error` doors, including safeguard codes also shortcut-checked in Layer 1
+  #   when `Poster` is called directly outside HTTP parsing.
   class Poster
     POST_FUNCTION_SQL = <<~SQL.squish.freeze
       SELECT public.post_bulk_payments(
@@ -66,10 +71,6 @@ module BulkPayments
     def call(parsed_batch)
       payment_ids = nil
 
-      # Rails owns the outer transaction at READ COMMITTED:
-      #   BEGIN ISOLATION LEVEL READ COMMITTED;
-      #   SELECT public.post_bulk_payments(...);
-      #   COMMIT;
       @connection.transaction(isolation: :read_committed, requires_new: false, joinable: false) do
         binds = build_binds(parsed_batch)
         result = @connection.exec_query(POST_FUNCTION_SQL, "BulkPayments::Post", binds, prepare: true)

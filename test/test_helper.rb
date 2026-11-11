@@ -3,9 +3,8 @@ require_relative "../config/environment"
 require "rails/test_help"
 
 module LedgerTestHelpers
-  # Independent admin connection used ONLY in tests to reset database state
-  # or inspect internal ledger tables (`payments`) that `ledger_runtime` is
-  # intentionally forbidden from reading or modifying directly.
+  # Separate `ledger_admin` connection used strictly in tests to reset fixture tables
+  # and inspect `public.payments`, which `ledger_runtime` has zero privileges on.
   def admin_connection
     @admin_connection ||= begin
       cfg = ActiveRecord::Base.connection_db_config.configuration_hash.merge(
@@ -76,9 +75,8 @@ end
 
 module ActiveSupport
   class TestCase
-    # Disable transactional test fixtures because `BulkPayments::Poster` explicitly opens
-    # top-level `BEGIN ISOLATION LEVEL READ COMMITTED` transactions (which cannot be nested
-    # inside savepoints) and tests exercise real commits, rollbacks, and multi-connection locks.
+    # `BulkPayments::Poster` opens top-level `BEGIN ISOLATION LEVEL READ COMMITTED` transactions
+    # (`joinable: false`), which cannot nest inside transactional test savepoints.
     self.use_transactional_tests = false
 
     include LedgerTestHelpers

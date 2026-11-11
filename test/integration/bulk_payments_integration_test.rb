@@ -14,8 +14,6 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
     @payee2 = create_firm!(name: "Payee Two Bookkeeping", opening_balance_cents: 0, uuid: PAYEE2_UUID)
   end
 
-  # --- Positive Scenarios & Thresholds ---
-
   test "persists exact specification payload atomically and returns 201" do
     raw_json = <<~JSON
       {
@@ -106,7 +104,7 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
   end
 
   test "accepts all valid USD decimal formats without floating point drift" do
-    # Include notorious binary float traps like 0.29, 19.99, 0.01, 0.50, 1, 1.2, 1.23, uppercase UUIDs
+    # IEEE-754 float traps (`0.29 * 100 == 28.999999999999996`, `19.99 * 100 == 1998.9999999999998`).
     amounts = [ "1", "1.2", "1.23", "0.01", "0.50", "0.29", "19.99", "9999.90" ]
     expected_cents = [ 100, 120, 123, 1, 50, 29, 1999, 999_990 ]
 
@@ -120,7 +118,7 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
     assert_response :created
     rows = fetch_all_payments
     assert_equal expected_cents, rows.map { |r| r[:amount_cents] }
-    assert_equal "Valid format 0 ", rows.first[:description] # Preserves original description string
+    assert_equal "Valid format 0 ", rows.first[:description]
   end
 
   test "accepts exact single-payment PG INTEGER max (21474836.47) and batch total exceeding int4 max" do
@@ -129,7 +127,7 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
     feeder1 = create_firm!(name: "Feeder 1", opening_balance_cents: max_int4)
     feeder2 = create_firm!(name: "Feeder 2", opening_balance_cents: max_int4)
 
-    # Fund whale_payer so its derived NUMERIC balance is 3 * 2,147,483,647 = 6,442,450,941 cents (> int4 max)
+    # 3 * 2,147,483,647 = 6,442,450,941 cents (> PostgreSQL `int4` max, proving `NUMERIC` derived balances).
     post_json(
       payer_firm_uuid: feeder1.uuid,
       payments: [ { amount: "21474836.47", payee_firm_uuid: whale_payer.uuid, description: "Top up 1" } ]
@@ -144,8 +142,6 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
 
     assert_equal 6_442_450_941, firm_balance_cents(whale_payer.uuid)
 
-    # Whale sender now spends all 6,442,450,941 cents in a single batch of three 21474836.47 payments,
-    # pushing PAYEE2's derived balance well beyond PostgreSQL INTEGER max (no recipient int4 cap).
     post_json(
       payer_firm_uuid: whale_payer.uuid,
       payments: Array.new(3) do |i|
@@ -159,7 +155,6 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
   end
 
   test "accepts batch boundary sizes of 1 and 1000 payments" do
-    # Minimum batch size: 1
     post_json(
       payer_firm_uuid: PAYER_UUID,
       payments: [ { amount: "0.01", payee_firm_uuid: PAYEE1_UUID, description: "Single item batch" } ]
@@ -167,7 +162,6 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
     assert_response :created
     assert_equal 1, JSON.parse(response.body)["payments_count"]
 
-    # Maximum batch size: 1000
     thousand_items = Array.new(1_000) do |idx|
       {
         amount: "0.01",
@@ -194,8 +188,6 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
     assert_response :created
     assert_equal 0, firm_balance_cents(PAYER_UUID)
   end
-
-  # --- Negative Scenarios & Off-By-One Thresholds ---
 
   test "rejects when payer balance is 1 cent below gross batch total and persists nothing" do
     post_json(
@@ -266,7 +258,7 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
       [ "Infinity", "invalid_amount_format" ],
       [ "", "invalid_amount_format" ],
       [ "10..50", "invalid_amount_format" ],
-      [ "１０.００", "invalid_amount_format" ], # Full-width Unicode digits
+      [ "１０.００", "invalid_amount_format" ], # U+FF11/U+FF10 full-width Unicode digits (visually resemble ASCII)
       [ 100, "invalid_amount_type" ],
       [ 100.5, "invalid_amount_type" ],
       [ nil, "invalid_amount_type" ],
@@ -287,16 +279,29 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
     assert_empty fetch_all_payments
   end
 
-  test "rejects self-payments (even when mixed with valid payments) and persists nothing" do
-    post_json(
-      payer_firm_uuid: PAYER_UUID,
-      payments: [
-        { amount: "10.00", payee_firm_uuid: PAYEE1_UUID, description: "Valid leg" },
-        { amount: "5.00", payee_firm_uuid: PAYER_UUID, description: "Self transfer leg" }
-      ]
-    )
+  test "rejects self-payments at the service shortcut layer without touching PostgreSQL" do
+    poster_called = false
+    original_call = BulkPayments::Poster.method(:call)
+    BulkPayments::Poster.define_singleton_method(:call) do |*args, **kwargs|
+      poster_called = true
+      original_call.call(*args, **kwargs)
+    end
 
+    begin
+      post_json(
+        payer_firm_uuid: PAYER_UUID,
+        payments: [
+          { amount: "10.00", payee_firm_uuid: PAYEE1_UUID, description: "Valid leg" },
+          { amount: "5.00", payee_firm_uuid: PAYER_UUID, description: "Self transfer leg" }
+        ]
+      )
+    ensure
+      BulkPayments::Poster.define_singleton_method(:call, original_call)
+    end
+
+    refute poster_called, "Expected PayloadParser shortcut guard to reject self-payment before Poster touches PostgreSQL"
     body = assert_error_door(expected_code: "self_payment")
+    assert_equal "payments[1].payee_firm_uuid", body.dig("error", "field")
     assert_equal 1, body.dig("error", "payment_index")
     assert_empty fetch_all_payments
     assert_equal 2_000_000, firm_balance_cents(PAYER_UUID)
@@ -324,10 +329,10 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
     bad_uuids = [
       "",
       "not-a-uuid",
-      "3f1c9a2e7b4d4c1e9a552d8e6f0b7c41", # missing hyphens
-      "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c4", # 1 char short
-      "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41aa", # too long
-      "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c4g", # non-hex char
+      "3f1c9a2e7b4d4c1e9a552d8e6f0b7c41",
+      "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c4",
+      "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41aa",
+      "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c4g",
       " 3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41",
       12345,
       nil
@@ -347,14 +352,12 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
       assert_error_door(expected_code: "invalid_uuid", context: "payee=#{bad_uuid.inspect}")
     end
 
-    # Existing syntax, unknown payer firm
     post_json(
       payer_firm_uuid: MISSING_UUID,
       payments: [ { amount: "1.00", payee_firm_uuid: PAYEE1_UUID, description: "Unknown payer" } ]
     )
     assert_error_door(expected_code: "unknown_payer_firm")
 
-    # Existing syntax, unknown payee firm on second item -> atomic rollback of whole batch
     post_json(
       payer_firm_uuid: PAYER_UUID,
       payments: [
@@ -438,7 +441,6 @@ class BulkPaymentsIntegrationTest < ActionDispatch::IntegrationTest
   end
 
   test "returns generic 500 JSON without leaking SQL or stack traces on unexpected internal failures" do
-    # Temporarily stub BulkPayments::Poster.call to simulate an unexpected internal exception
     original_call = BulkPayments::Poster.method(:call)
     log_output = StringIO.new
     original_logger = Rails.logger

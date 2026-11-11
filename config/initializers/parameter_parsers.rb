@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
-# Disable ActionDispatch's implicit JSON parameter parser so JSON bodies are
-# parsed once and validated strictly by BulkPayments::PayloadParser, allowing
-# malformed JSON to return HTTP 422 with a detailed RFC 8259 syntax explanation
-# rather than ActionDispatch::Http::Parameters::ParseError (HTTP 400).
+# ActionDispatch's default JSON parser raises `ActionDispatch::Http::Parameters::ParseError`
+# (HTTP 400) before routing. Clearing `parameter_parsers` hands raw request bytes to
+# `BulkPayments::PayloadParser` so malformed JSON returns HTTP 422 with an RFC 8259 door.
 ActionDispatch::Request.parameter_parsers = {}

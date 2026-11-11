@@ -44,7 +44,6 @@ class LedgerInvariantsAndSecurityTest < ActiveSupport::TestCase
     firm2 = create_firm!(name: "Firm Two", opening_balance_cents: 10_000)
     conn = ApplicationRecord.lease_connection
 
-    # Column-level UPDATE(name) blocks updating opening_balance_cents, uuid, id, or created_at
     err_opening = assert_raises(ActiveRecord::StatementInvalid) do
       conn.exec_query(
         "UPDATE public.firm_descriptions SET opening_balance_cents = 999999 WHERE id = $1",
@@ -81,13 +80,11 @@ class LedgerInvariantsAndSecurityTest < ActiveSupport::TestCase
     end
     assert_kind_of PG::InsufficientPrivilege, err_created_at.cause
 
-    # DELETE on firm_descriptions is forbidden
     err_del_firm = assert_raises(ActiveRecord::StatementInvalid) do
       conn.exec_query("DELETE FROM public.firm_descriptions WHERE id = $1", "DeleteFirmDenied", [ firm1.id ])
     end
     assert_kind_of PG::InsufficientPrivilege, err_del_firm.cause
 
-    # Direct SELECT, INSERT, UPDATE, DELETE, TRUNCATE on payments are all forbidden for ledger_runtime
     [
       "SELECT * FROM public.payments",
       "INSERT INTO public.payments (payer_firm_id, payee_firm_id, amount_cents, description) VALUES (#{firm1.id}, #{firm2.id}, 100, 'Bypass')",
@@ -101,12 +98,10 @@ class LedgerInvariantsAndSecurityTest < ActiveSupport::TestCase
       assert_kind_of PG::InsufficientPrivilege, err.cause
     end
 
-    # Read-only view `firms` cannot be mutated
     assert_raises(ActiveRecord::StatementInvalid) do
       conn.execute("DELETE FROM public.firms")
     end
 
-    # Altering database objects or creating tables in public schema is forbidden
     [
       "CREATE TABLE public.rogue_table (id int)",
       "DROP VIEW public.firms",
@@ -190,7 +185,6 @@ class LedgerInvariantsAndSecurityTest < ActiveSupport::TestCase
       assert_equal "invalid_transaction_isolation", err.cause.result.error_field(PG::Result::PG_DIAG_MESSAGE_DETAIL)
     end
 
-    # Reject READ ONLY transaction even under READ COMMITTED
     err_ro = assert_raises(ActiveRecord::StatementInvalid) do
       conn.transaction(isolation: :read_committed, joinable: false) do
         conn.execute("SET LOCAL transaction_read_only = on")
@@ -241,6 +235,25 @@ class LedgerInvariantsAndSecurityTest < ActiveSupport::TestCase
     assert_empty fetch_all_payments
   end
 
+  test "Poster translates Layer 2 PostgreSQL safeguard rejections into BulkPayments::Error doors when Layer 1 is bypassed" do
+    payer = create_firm!(name: "Safeguard Payer", opening_balance_cents: 50_000)
+    bypassed_batch = BulkPayments::PayloadParser::ParsedBatch.new(
+      payer_firm_uuid: payer.uuid,
+      payee_firm_uuids: [ payer.uuid ],
+      amounts_cents: [ 500 ],
+      descriptions: [ "Direct Poster call bypassing PayloadParser" ]
+    )
+
+    err = assert_raises(BulkPayments::Error) do
+      BulkPayments::Poster.call(bypassed_batch)
+    end
+
+    assert_equal "self_payment", err.code
+    assert_equal "payments[0].payee_firm_uuid", err.field
+    assert_equal 0, err.payment_index
+    assert_empty fetch_all_payments
+  end
+
   test "verifies global accounting conservation invariants across multi-party transfers" do
     firms = Array.new(5) { |i| create_firm!(name: "Firm #{i}", opening_balance_cents: 100_000 * (i + 1)) }
     total_opening = firms.sum(&:opening_balance_cents)
@@ -275,8 +288,8 @@ class LedgerInvariantsAndSecurityTest < ActiveSupport::TestCase
       assert_equal outgoing_from_sender, credits_from_sender
     end
 
-    # Invariant 2: Raw history + opening funds reproduces every firm's view balance exactly,
-    # and global sum of balances equals global sum of opening funds (conservation of money).
+    # Invariant 2: Raw history + opening funds reproduces every firm's view balance,
+    # and global sum of derived balances equals global sum of opening funds.
     sum_of_derived_balances = 0
     firms.each do |firm|
       incoming = all_payments.select { |p| p[:payee_firm_id] == firm.id }.sum { |p| p[:amount_cents] }
@@ -290,7 +303,7 @@ class LedgerInvariantsAndSecurityTest < ActiveSupport::TestCase
 
     assert_equal total_opening, sum_of_derived_balances
 
-    # Invariant 3: No hidden triggers on payments other than our immutability guard triggers.
+    # Invariant 3: Only immutability guard triggers exist on `payments` (zero hidden balance-snapshot triggers).
     triggers = admin_connection.exec(<<~SQL).map { |r| r["tgname"] }
       SELECT tgname
       FROM pg_catalog.pg_trigger

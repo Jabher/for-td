@@ -1,12 +1,11 @@
 # frozen_string_literal: true
 
-# Large-scale benchmark & PostgreSQL 18 EXPLAIN (ANALYZE, BUFFERS) investigation.
+# Large-scale benchmark & PostgreSQL 18 `EXPLAIN (ANALYZE, BUFFERS)` harness.
 #
 # Run via:
 #   DB_ROLE=admin bin/rails runner script/benchmark_and_explain.rb
 #
-# Uses a dedicated scratch database (`taxdome_ledger_benchmark`) so development/test/production
-# databases remain clean. Automatically drops the scratch database unless KEEP_BENCH_DB=1.
+# Provisions an isolated `taxdome_ledger_benchmark` database (dropped on exit unless `KEEP_BENCH_DB=1`).
 
 require "json"
 
@@ -51,7 +50,7 @@ begin
 
   puts "=== 2. Seeding #{FIRM_COUNT} firms and #{HISTORICAL_PAYMENT_COUNT} historical payments ==="
   seed_time = measure_seconds do
-    # Disable user triggers only for bulk synthetic fixture load, then re-enable immediately.
+    # Bypass per-row immutability triggers strictly during bulk synthetic fixture load.
     admin_conn.exec("ALTER TABLE public.payments DISABLE TRIGGER USER")
     admin_conn.exec("ALTER TABLE public.firm_descriptions DISABLE TRIGGER USER")
 
@@ -64,9 +63,8 @@ begin
       FROM generate_series(1, $1::int) AS g
     SQL
 
-    # Skewed distribution + uniform baseline:
-    # Firm #1 ("hot whale firm") has ~25,000 outgoing and ~25,000 incoming historical payments,
-    # while the remaining 950,000 payments are distributed across all 10,000 firms.
+    # Skewed distribution: Firm #1 ("hot whale") carries ~25k outgoing + ~25k incoming rows;
+    # remaining ~950k rows distribute across Firms #2..#10,000 via coprime stride `7919`.
     admin_conn.exec_params(<<~SQL, [ FIRM_COUNT, HISTORICAL_PAYMENT_COUNT ])
       INSERT INTO public.payments (payer_firm_id, payee_firm_id, amount_cents, description)
       SELECT
@@ -136,7 +134,6 @@ begin
 
   puts "\n--- 3b. Step 2 inside post_bulk_payments: Derived balance read for typical firm (~100 payments) ---"
   admin_conn.exec("PREPARE explain_balance_normal(bigint) AS SELECT f.balance_cents FROM public.firms AS f WHERE f.id = $1")
-  # Warm buffer cache once then capture steady-state execution
   admin_conn.exec("EXECUTE explain_balance_normal(#{normal_firm_id})")
   plan_bal_normal = admin_conn.exec("EXPLAIN (ANALYZE, BUFFERS) EXECUTE explain_balance_normal(#{normal_firm_id})").map { |r| r["QUERY PLAN"] }.join("\n")
   puts plan_bal_normal
@@ -221,7 +218,6 @@ begin
       )
     end
 
-    # Warmup
     warm_batch = BulkPayments::PayloadParser.parse(raw_payloads.first)
     BulkPayments::Poster.call(warm_batch)
 
@@ -249,7 +245,6 @@ begin
     )
   end
 
-  # Hot whale sender latency (50,000 historical rows)
   whale_latencies = []
   whale_json = JSON.generate(
     payer_firm_uuid: hot_firm_uuid,
@@ -268,7 +263,6 @@ begin
     whale_sorted[25], whale_sorted[47], whale_sorted[49]
   )
 
-  # Concurrent multi-tenant throughput (8 threads across distinct senders vs same-sender contention)
   [ :distinct_senders, :same_sender_contention ].each do |mode|
     threads_count = 8
     batches_per_thread = 25
@@ -313,7 +307,6 @@ begin
     )
   end
 
-  # Final conservation check on the 1M+ benchmark database
   conservation = admin_conn.exec(<<~SQL).first
     SELECT
       (SELECT SUM(opening_balance_cents::numeric) FROM public.firm_descriptions) AS total_opening,

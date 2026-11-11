@@ -1,14 +1,10 @@
 # frozen_string_literal: true
 
-# Represents the `public.firm_descriptions` metadata table.
-#
-# Runtime role (`ledger_runtime`) permissions:
-# - INSERT (uuid, name, opening_balance_cents)
-# - UPDATE (name) only
-# - SELECT (id, uuid, name, opening_balance_cents, created_at, updated_at)
-#
-# Timestamps are managed strictly by PostgreSQL defaults and triggers so
-# column-level UPDATE(name) remains enforced at the database layer.
+# Column-ACL pin: `ledger_runtime` holds `INSERT (uuid, name, opening_balance_cents)`
+# and column-level `UPDATE (name)` ONLY (`CreateFinancialLedger`).
+# `record_timestamps = false` prevents ActiveRecord from injecting `created_at` / `updated_at`
+# into `INSERT` or `UPDATE` SQL, which PostgreSQL would reject with `42501 insufficient_privilege`;
+# column defaults and `guard_firm_descriptions_immutability()` maintain timestamps inside PG.
 class FirmDescription < ApplicationRecord
   self.table_name = "firm_descriptions"
   self.record_timestamps = false

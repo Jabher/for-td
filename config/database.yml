@@ -1,10 +1,5 @@
-# PostgreSQL 18 configuration.
-#
-# Connection roles:
-# - DB_ADMIN_USER (default: ledger_admin) is used ONLY by explicit migration /
-#   schema preparation tasks (e.g., DB_ROLE=admin bin/rails db:prepare).
-# - DB_RUNTIME_USER (default: ledger_runtime) is the least-privilege runtime role
-#   used by the Rails web server and application connections.
+# Role split: `DB_ROLE=admin` (`ledger_admin`) is scoped strictly to migration/schema
+# tasks; the web server runs as `ledger_runtime` (least-privilege role; see `CreateFinancialLedger`).
 default: &default
   adapter: postgresql
   encoding: unicode

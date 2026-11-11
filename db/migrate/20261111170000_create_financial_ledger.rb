@@ -1,5 +1,18 @@
 # frozen_string_literal: true
 
+# Layer 2 — Database Safeguard Layer (complements `BulkPayments::PayloadParser` Layer 1 shortcuts).
+#
+# Even if Layer 1 is bypassed (direct SQL callers, future endpoints, or a Ruby bug), PostgreSQL
+# makes invalid states, race overdrafts, and ledger mutation impossible by construction:
+# 1. `public.post_bulk_payments`: `VOLATILE SECURITY DEFINER` owned by `ledger_definer` (`NOLOGIN`)
+#    with fixed `search_path = pg_catalog, pg_temp`. Independently re-verifies writable
+#    `READ COMMITTED` isolation, array/item bounds, self-payment prohibition, sender-only
+#    `FOR NO KEY UPDATE` serialization, separate-statement `NUMERIC` balance check, and atomic batch `INSERT`.
+# 2. Table `CHECK` & `ON UPDATE/DELETE RESTRICT` `FOREIGN KEY` constraints on `firm_descriptions` and `payments`.
+# 3. `BEFORE UPDATE/DELETE/TRUNCATE` triggers enforcing append-only `payments` and immutable firm columns.
+# 4. Least-privilege grants (`apply_ledger_security`) restricting `ledger_runtime` to `INSERT` +
+#    column-level `UPDATE(name)` on `firm_descriptions`, `SELECT` on `firm_descriptions`/`firms`,
+#    and `EXECUTE` on `post_bulk_payments` (zero direct access to `payments` or DDL).
 class CreateFinancialLedger < ActiveRecord::Migration[8.1]
   def up
     execute <<~SQL
@@ -15,7 +28,6 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
       END
       $bootstrap_roles$;
 
-      -- 1. firm_descriptions: stable firm ID, unique public UUID, name, non-negative opening_balance_cents.
       CREATE TABLE public.firm_descriptions (
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         uuid UUID NOT NULL DEFAULT pg_catalog.uuidv7(),
@@ -27,7 +39,6 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
         CONSTRAINT chk_firm_descriptions_name_not_blank CHECK (pg_catalog.btrim(name, E' \\t\\r\\n\\v\\f') <> '')
       );
 
-      -- 2. payments: raw append-only ledger of positive integer-cent transfers between distinct firms.
       CREATE TABLE public.payments (
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         payer_firm_id BIGINT NOT NULL,
@@ -44,7 +55,7 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
         CONSTRAINT chk_payments_description_not_blank CHECK (pg_catalog.btrim(description, E' \\t\\r\\n\\v\\f') <> '')
       );
 
-      -- Covering indexes for Index-Only Scans on firm lookups and balance aggregation by payer/payee.
+      -- `INCLUDE` columns enable heap-free Index-Only Scans (`Heap Fetches: 0`) for sender lookup and balance sums.
       CREATE UNIQUE INDEX idx_firm_descriptions_uuid_covering
         ON public.firm_descriptions (uuid) INCLUDE (id);
 
@@ -54,7 +65,7 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
       CREATE INDEX idx_payments_payer_firm_id_amount
         ON public.payments (payer_firm_id) INCLUDE (amount_cents);
 
-      -- 3. Immutability triggers (defense-in-depth alongside column/table privileges).
+      -- Defense-in-depth immutability safeguard: blocks mutation/deletion even by privileged DB roles.
       CREATE OR REPLACE FUNCTION public.guard_firm_descriptions_immutability()
       RETURNS TRIGGER
       LANGUAGE plpgsql
@@ -119,9 +130,8 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
       FOR EACH STATEMENT
       EXECUTE FUNCTION public.guard_firm_descriptions_immutability();
 
-      -- 4. firms: read-only view deriving exact NUMERIC balance_cents directly from opening funds + payment history.
-      -- Uses grouped subqueries so PostgreSQL 18 pushes down WHERE id = $1 into Index-Only Scans for single-firm reads
-      -- while using single-pass HashAggregates for full-view queries.
+      -- Grouped subqueries allow PG 18 to push `WHERE id = $1` into two Index-Only Scans
+      -- for single-firm reads while executing Parallel HashAggregates on full-view scans.
       CREATE VIEW public.firms AS
       SELECT
         fd.id,
@@ -148,7 +158,6 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
         GROUP BY p_out.payer_firm_id
       ) AS outgoing ON outgoing.firm_id = fd.id;
 
-      -- 5. post_bulk_payments: sole VOLATILE SECURITY DEFINER entry point for posting bulk payments.
       CREATE OR REPLACE FUNCTION public.post_bulk_payments(
         p_payer_uuid UUID,
         p_payee_uuids UUID[],
@@ -173,7 +182,8 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
         v_insert_sql TEXT;
         v_inserted_ids BIGINT[];
       BEGIN
-        -- Enforce caller transaction contract: writable READ COMMITTED transaction.
+        -- `REPEATABLE READ` / `SERIALIZABLE` would read a transaction-start snapshot instead of
+        -- post-lock committed credits; `READ COMMITTED` is mandatory for lock-then-balance correctness.
         v_isolation := pg_catalog.current_setting('transaction_isolation');
         IF v_isolation <> 'read committed' THEN
           RAISE EXCEPTION USING
@@ -192,7 +202,8 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
             HINT = 'Start a read-write READ COMMITTED transaction before calling post_bulk_payments.';
         END IF;
 
-        -- Validate function arguments independently of HTTP validation.
+        -- Database safeguard guards: re-enforce every input invariant independently of Ruby Layer 1
+        -- so direct SQL callers or future service paths cannot bypass batch/item validation.
         IF p_payer_uuid IS NULL THEN
           RAISE EXCEPTION USING
             ERRCODE = '22004',
@@ -241,7 +252,6 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
             HINT = 'Submit between 1 and 1000 payment items per request.';
         END IF;
 
-        -- Check per-item argument invariants (non-null payee, strictly positive amount_cents, non-blank description, no self-payment).
         SELECT u.ord
         INTO v_bad_ord
         FROM ROWS FROM (
@@ -312,8 +322,8 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
             HINT = 'Ensure every payee_firm_uuid differs from payer_firm_uuid.';
         END IF;
 
-        -- Step 1: Serialize spending by this sender using the REAL metadata row.
-        -- Do NOT lock recipient firm rows; lock is held until the caller commits or rolls back.
+        -- Sender-only serialization law: lock ONLY the sender's `firm_descriptions` row (`FOR NO KEY UPDATE`),
+        -- never recipients. Incoming transfers take only FK `FOR KEY SHARE`, preventing cross-firm deadlocks.
         BEGIN
           SELECT fd.id INTO STRICT v_payer_id
           FROM public.firm_descriptions AS fd
@@ -328,17 +338,18 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
               HINT = 'Verify payer_firm_uuid refers to an existing firm.';
         END;
 
-        -- Step 2: After acquiring the sender lock, read the derived balance in a separate command.
+        -- Separate-statement balance law: under `READ COMMITTED`, a new SQL command acquires a fresh
+        -- snapshot AFTER `FOR NO KEY UPDATE` grants, observing all transfers committed while waiting.
+        -- Combining lock + sum in one query would evaluate against a pre-lock snapshot and overdraft!
         SELECT f.balance_cents INTO STRICT v_balance
         FROM public.firms AS f
         WHERE f.id = v_payer_id;
 
-        -- Compute exact NUMERIC gross batch total by casting each amount before summation.
         SELECT SUM(u.amount_cents::pg_catalog.numeric)
         INTO STRICT v_gross_total
         FROM pg_catalog.unnest(p_amounts_cents) AS u(amount_cents);
 
-        -- Verify all payee firms exist (read-only lookup, no row locks acquired on recipients).
+        -- Read-only payee existence check (acquires zero row locks on recipients).
         SELECT u.ord, u.payee_uuid
         INTO v_bad_ord, v_bad_uuid
         FROM (
@@ -361,7 +372,6 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
             HINT = 'Ensure every payee_firm_uuid refers to an existing firm.';
         END IF;
 
-        -- Step 3: Reject if balance < full outgoing total.
         IF v_balance < v_gross_total THEN
           RAISE EXCEPTION USING
             ERRCODE = 'P0001',
@@ -375,7 +385,8 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
             HINT = 'Reduce the total requested payment amount or wait for incoming funds before retrying.';
         END IF;
 
-        -- Step 4: Persist every requested payment atomically in batch order using VALUES (...), (...), ...
+        -- Dynamic `VALUES (...), ...` preserves the explicit multi-tuple `INSERT ... VALUES` contract
+        -- for arbitrary 1..1000 batch sizes while safely quoting every literal via `%L`.
         SELECT
           'WITH inserted AS (INSERT INTO public.payments (payer_firm_id, payee_firm_id, amount_cents, description) VALUES ' ||
           pg_catalog.string_agg(
@@ -418,9 +429,8 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
       END;
       $fn$;
 
-      -- 6. Apply ownership and strict least-privilege grants.
-      -- Also encapsulated in apply_ledger_security() so db:schema:load / structure_load (which uses pg_dump --no-owner --no-privileges)
-      -- restores identical security posture on fresh databases.
+      -- Encapsulated as a callable function because ActiveRecord's `pg_dump --no-owner --no-privileges`
+      -- omits `ALTER ... OWNER` and `GRANT`/`REVOKE` statements from `db/structure.sql` (`lib/tasks/ledger_security.rake`).
       CREATE OR REPLACE FUNCTION public.apply_ledger_security()
       RETURNS void
       LANGUAGE plpgsql
@@ -435,7 +445,6 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
           CREATE ROLE ledger_runtime LOGIN PASSWORD 'ledger_runtime_secret' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
         END IF;
 
-        -- Transfer object ownership to dedicated non-login SECURITY DEFINER owner role.
         ALTER TABLE public.firm_descriptions OWNER TO ledger_definer;
         ALTER TABLE public.payments OWNER TO ledger_definer;
         ALTER VIEW public.firms OWNER TO ledger_definer;
@@ -443,11 +452,9 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
         ALTER FUNCTION public.guard_payments_immutability() OWNER TO ledger_definer;
         ALTER FUNCTION public.post_bulk_payments(UUID, UUID[], INTEGER[], TEXT[]) OWNER TO ledger_definer;
 
-        -- Lock down schema creation from PUBLIC and runtime role.
         REVOKE CREATE ON SCHEMA public FROM PUBLIC, ledger_runtime;
         GRANT USAGE ON SCHEMA public TO ledger_definer, ledger_runtime;
 
-        -- Revoke all default table/view/sequence/function privileges.
         REVOKE ALL ON TABLE public.firm_descriptions FROM PUBLIC, ledger_runtime;
         REVOKE ALL ON TABLE public.payments FROM PUBLIC, ledger_runtime;
         REVOKE ALL ON TABLE public.firms FROM PUBLIC, ledger_runtime;
@@ -457,11 +464,6 @@ class CreateFinancialLedger < ActiveRecord::Migration[8.1]
         REVOKE ALL ON FUNCTION public.guard_payments_immutability() FROM PUBLIC, ledger_runtime;
         REVOKE ALL ON FUNCTION public.post_bulk_payments(UUID, UUID[], INTEGER[], TEXT[]) FROM PUBLIC, ledger_runtime;
 
-        -- Grant ledger_runtime ONLY:
-        -- 1) Read access needed for firm operations (firm_descriptions and read-only firms view)
-        -- 2) Creating firms with initial opening_balance_cents (uuid, name, opening_balance_cents)
-        -- 3) Column-level UPDATE(name) on firm_descriptions (never id, uuid, opening_balance_cents, timestamps)
-        -- 4) EXECUTE on post_bulk_payments
         GRANT SELECT (id, uuid, name, opening_balance_cents, created_at, updated_at)
           ON TABLE public.firm_descriptions TO ledger_runtime;
         GRANT INSERT (uuid, name, opening_balance_cents)

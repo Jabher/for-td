@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-ledger_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-ledger_admin_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-taxdome_ledger_production}
+      APP_DB_USER: ${APP_DB_USER:-ledger_runtime}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-ledger_runtime_secret}
+      LEDGER_OWNER_ROLE: ${LEDGER_OWNER_ROLE:-ledger_definer}
+    ports:
+      - "${POSTGRES_PORT:-5434}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      RAILS_ENV: ${RAILS_ENV:-production}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:-taxdome_ledger_docker_compose_secret_key_base_64_chars_minimum_0001}
+      DB_HOST: db
+      DB_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-taxdome_ledger_production}
+      DB_ADMIN_USER: ${POSTGRES_ADMIN_USER:-ledger_admin}
+      DB_ADMIN_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-ledger_admin_secret}
+      DB_RUNTIME_USER: ${APP_DB_USER:-ledger_runtime}
+      DB_RUNTIME_PASSWORD: ${APP_DB_PASSWORD:-ledger_runtime_secret}
+      RAILS_LOG_TO_STDOUT: "true"
+      RAILS_MAX_THREADS: ${RAILS_MAX_THREADS:-5}
+    ports:
+      - "${WEB_PORT:-3001}:3000"
+
+volumes:
+  postgres_data:

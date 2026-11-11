@@ -30,7 +30,8 @@ Rails.application.configure do
   config.active_support.deprecation = :log
 
   # Raise an error on page load if there are pending migrations.
-  config.active_record.migration_error = :page_load
+  # Disabled when running as the restricted runtime DB role (which intentionally has no schema_migrations read privilege).
+  config.active_record.migration_error = ENV["DB_ROLE"] == "admin" ? :page_load : false
 
   # Highlight code that triggered database queries in logs.
   config.active_record.verbose_query_logs = true

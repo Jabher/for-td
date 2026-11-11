@@ -1,8 +1,9 @@
 #!/bin/bash -e
 
-# If running the rails server then create or migrate existing database
+# If running the rails server then create or migrate existing database using
+# the migration admin role, then exec the server under the restricted runtime role.
 if [ "${@: -2:1}" == "./bin/rails" ] && [ "${@: -1:1}" == "server" ]; then
-  ./bin/rails db:prepare
+  DB_ROLE=admin ./bin/rails db:prepare
 fi
 
 exec "${@}"

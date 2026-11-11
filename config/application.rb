@@ -40,5 +40,9 @@ module TaxdomeTestTask
     # Middleware like session, flash, cookies can be added back manually.
     # Skip views, helpers and assets when generating a new resource.
     config.api_only = true
+
+    # Dump database schema as SQL so PostgreSQL views, PL/pgSQL functions,
+    # triggers, and constraints are preserved when recreating a fresh database.
+    config.active_record.schema_format = :sql
   end
 end

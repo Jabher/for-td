@@ -18,12 +18,12 @@ Rails.application.configure do
   # Configure public file server for tests with cache-control for performance.
   config.public_file_server.headers = { "cache-control" => "public, max-age=3600" }
 
-  # Show full error reports.
-  config.consider_all_requests_local = true
-  config.cache_store = :null_store
-
   # Render exception templates for rescuable exceptions and raise for other exceptions.
-  config.action_dispatch.show_exceptions = :rescuable
+  # Use :all so unhandled internal exceptions are tested through ApplicationController's 500 JSON handler.
+  config.action_dispatch.show_exceptions = :all
+  config.consider_all_requests_local = false
+  config.cache_store = :null_store
+  config.active_record.maintain_test_schema = false
 
   # Disable request forgery protection in test environment.
   config.action_controller.allow_forgery_protection = false

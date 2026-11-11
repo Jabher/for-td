@@ -1,9 +1,9 @@
 #!/bin/bash -e
 
-# Scope `DB_ROLE=admin` strictly to the `db:prepare` subprocess so `exec "${@}"`
+# Scope `DB_ROLE=admin` strictly to `db:prepare db:seed` so `exec "${@}"`
 # boots Puma under the least-privilege `ledger_runtime` role (`config/database.yml`).
 if [ "${@: -2:1}" == "./bin/rails" ] && [ "${@: -1:1}" == "server" ]; then
-  DB_ROLE=admin ./bin/rails db:prepare
+  DB_ROLE=admin ./bin/rails db:prepare db:seed
 fi
 
 exec "${@}"

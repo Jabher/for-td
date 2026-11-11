@@ -1,88 +1,68 @@
-# Bulk Payments Financial Ledger API
+# Bulk Payments Ledger (`POST /bulk_payments`)
 
-Minimal, financial-grade bulk payment ledger built with **Ruby 4.0.9**, **Rails 8.1.4.1** (API mode, Puma), and **PostgreSQL 18**.
+Minimal financial ledger on Ruby 4.0, Rails 8.1 (API mode, Puma), and PostgreSQL 18. Design inspired by typical distributed ledger and transaction databases like TigerBeetle.
 
-## Quick Start (Docker & Docker Compose Only)
+> Time spent: ~4-5 hours
+> 
+> How proud: fairly proud for SQL part, good enough for Ruby part.
+> 
+> Also, very proud of not forgetting Ruby & Rails after a decade of not writing it.
 
-Nothing is required on the host beyond Docker and Docker Compose:
+## 1. Architecture, Ledger Model, and Design Choices
+
+**All-or-nothing posting.** `POST /bulk_payments` is the sole endpoint. `BulkPayments::Poster` opens one `READ COMMITTED` transaction and calls `public.post_bulk_payments`. PostgreSQL locks only the sender row in `public.firm_descriptions` (`FOR NO KEY UPDATE`), reads the sender's balance from `public.firms` in a separate query, checks invariants, and inserts the batch via one static `MERGE ... WITH ORDINALITY` statement. Either the sender covers the gross sum and all payments commit (`201 Created`), or PostgreSQL raises an error, rolls back the batch, and Rails returns `422`.
+
+**Ledger storage and safeguards.** Like a blockchain ledger, balances are never stored as mutable counters that can drift from history. `public.firm_descriptions` stores metadata and immutable `opening_balance_cents`; `public.payments` is an append-only log of immutable transfers; and `public.firms` derives `balance_cents` live (`opening + incoming - outgoing`) via correlated `NUMERIC` sums over covering indexes. Safeguards run in two layers:
+- **Service shortcut (`BulkPayments::PayloadParser`)**: rejects malformed JSON, bad shapes, invalid USD strings or UUIDs, and self-transfers in memory before leasing a DB connection.
+- **Database safeguards (`CreateFinancialLedger`)**: `ledger_runtime` can only insert firms, `UPDATE (name)` on `firm_descriptions`, read `firms`, and `EXECUTE` `SECURITY DEFINER` `public.post_bulk_payments` (owned by `ledger_definer`). Direct `payments` access is revoked, and `CHECK`/`FOREIGN KEY` constraints plus `BEFORE UPDATE/DELETE/TRUNCATE` triggers block mutation even by admin roles.
+
+**Design narrowings and seeding three firms.** Compared to the challenge's mutable `firms` table: `public.firms` is a read-only view; batches are capped at `1..1000`; and self-transfers (`payer == payee`) are prohibited (`Idempotency-Key` is out of scope). Because `public.firms` is a view and `id` is `GENERATED ALWAYS AS IDENTITY`, replace `INSERT INTO firms (id, name, balance_cents, uuid)` with `public.firm_descriptions (name, opening_balance_cents, uuid)`. **Pinecrest CPA Group**, **Lopez Bookkeeping**, and **Nair Tax Services** are seeded automatically via `db/seeds.rb`; for manual SQL (`ledger_runtime` or admin):
+
+```sql
+INSERT INTO public.firm_descriptions (name, opening_balance_cents, uuid)
+VALUES ('Pinecrest CPA Group', 5000000, '3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41'),
+       ('Lopez Bookkeeping', 50000, '8b2e4c71-0d3a-4f6e-b1c9-5a7d2e9f4c10'),
+       ('Nair Tax Services', 200000, 'e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25');
+```
+
+Also, **idempotence was intentionally omitted** since it was outside the scope of original task. Idempotence key processing was not required by the original task scope, so it was omitted explicitly to keep the code smaller (since there's a lot of invariants enforced already, producing quite large SQL migrations).
+
+## 2. How to Run
+
+Boot PostgreSQL 18 (`:5434`), run migrations + seeds, and start Puma (`:3001`):
 
 ```bash
 docker compose up -d --build
 ```
 
-- **Rails API (Puma)**: `http://localhost:3001` (override via `WEB_PORT`)
-- **PostgreSQL 18**: `localhost:5434` (override via `POSTGRES_PORT`)
+Re-run idempotent seeds anytime:
 
-Run the full test suite inside Docker (against PostgreSQL 18):
+```bash
+docker compose run --rm -e DB_ROLE=admin web ./bin/rails db:seed
+```
+
+Run tests (`21 runs, 43 assertions, 0 failures` in ~1s):
 
 ```bash
 docker compose run --rm -e RAILS_ENV=test -e DB_ROLE=admin web ./bin/rails db:purge db:schema:load
 docker compose run --rm -e RAILS_ENV=test web ./bin/rails test
 ```
 
-Run the large-scale benchmark & `EXPLAIN (ANALYZE, BUFFERS)` investigation:
+Run benchmarks and `EXPLAIN (ANALYZE, BUFFERS)` (`script/benchmark_and_explain.rb`):
 
 ```bash
 docker compose run --rm -e DB_ROLE=admin web ./bin/rails runner script/benchmark_and_explain.rb
 ```
 
-## Endpoint Contract
+Expect an isolated 10k-firm / 1M-payment DB, plans confirming `Heap Fetches: 0` Index-Only Scans and static `MERGE` inserts, p50/p95/p99 latency across 1–1,000 item batches, a 50k-row hot sender, and 8-thread contention, conservation check, and cleanup.
 
-`POST /bulk_payments` is the sole endpoint in this service.
-*(Note: HTTP `Idempotency-Key` support is intentionally out of scope.)*
+## 3. Guarantees, Invariants, and Test Enforcement
 
-### Request (`201 Created` on commit, `422 Unprocessable Content` on validation/accounting rejection)
+- **Conservation and exactness**: `public.firms` balances sum to total opening funds; sender debits equal recipient credits; USD strings map to exact `int4` cents (`$0.01`–`$21,474,836.47`) while balances and batch totals use uncapped `NUMERIC`.
+- **Immutability and safe errors**: Committed rows and opening funds are immutable; bad inputs return `422` (`what`, `why`, `how_to_fix`), and unexpected faults return SQL-redacted `500` JSON.
+- **Deadlock-free concurrency**: Sender-only locks serialize debits without blocking incoming credits.
 
-```json
-{
-  "payer_firm_uuid": "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41",
-  "payments": [
-    {
-      "amount": "6250",
-      "payee_firm_uuid": "e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25",
-      "description": "Overflow returns, August 2026"
-    },
-    {
-      "amount": "5800.5",
-      "payee_firm_uuid": "e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25",
-      "description": "Amended returns, August 2026"
-    },
-    {
-      "amount": "1200.75",
-      "payee_firm_uuid": "8b2e4c71-0d3a-4f6e-b1c9-5a7d2e9f4c10",
-      "description": "Bookkeeping cleanup, 3 clients"
-    }
-  ]
-}
-```
-
-### Error Format (`errors-as-doors`)
-
-Every `422` response returns a stable JSON structure explaining **what** failed, **why** it failed, and **how_to_fix** it:
-
-```json
-{
-  "error": {
-    "code": "insufficient_funds",
-    "what": "Insufficient funds for payer firm 3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41: available 10000 cents, requested batch total 10001 cents.",
-    "why": "The payer firm's current derived balance cannot cover the gross sum of all requested payments in this batch.",
-    "how_to_fix": "Reduce the total requested payment amount or wait for incoming funds before retrying.",
-    "field": "payments"
-  }
-}
-```
-
-## Architecture & Database Security
-
-- **`public.firm_descriptions`**: Immutable `id`, immutable indexed `uuid`, mutable `name`, and immutable non-negative `opening_balance_cents` (`INTEGER`).
-- **`public.payments`**: Strictly append-only, immutable ledger of transfers (`payer_firm_id`, `payee_firm_id`, `amount_cents` `INTEGER > 0`, non-blank `description`). Indexed with covering B-trees `(payee_firm_id) INCLUDE (amount_cents)` and `(payer_firm_id) INCLUDE (amount_cents)` for heap-free Index-Only Scans.
-- **`public.firms`**: Read-only view deriving exact `NUMERIC` `balance_cents` via correlated `COALESCE((SELECT SUM(amount_cents::numeric) ...), 0::numeric)` sums over `opening_balance_cents + incoming - outgoing` with zero stored snapshots or triggers updating balances.
-- **`public.post_bulk_payments(...)`**: `VOLATILE` `SECURITY DEFINER` PL/pgSQL function owned by `ledger_definer` with `SET search_path = pg_catalog, pg_temp`. Enforces `READ COMMITTED`, acquires `FOR NO KEY UPDATE` exclusively on the sender row in `firm_descriptions`, reads the fresh derived `NUMERIC` balance from `firms` in a separate SQL command, validates all accounting invariants, and atomically inserts the batch via a single static PG 17+ `MERGE INTO public.payments ... ON FALSE WHEN NOT MATCHED THEN INSERT ... RETURNING` statement ordered by `WITH ORDINALITY`.
-- **Least-Privilege Runtime Role (`ledger_runtime`)**: Can `INSERT (uuid, name, opening_balance_cents)` and `UPDATE (name)` on `firm_descriptions`, `SELECT` on `firm_descriptions` and `firms`, and `EXECUTE` `post_bulk_payments`. Cannot read or write `payments` directly, cannot update `id`/`uuid`/`opening_balance_cents`, cannot delete rows, and cannot alter database objects.
-
-## Agent Skills Included in Repository
-
-- [`skills/errors-as-doors/`](skills/errors-as-doors/SKILL.md) (with [cross-domain research consolidation](skills/errors-as-doors/references/errors-as-doors-cross-domain-2026-05-30.md)): educational boundary rejection design (`fact -> reason -> action` doors).
-- [`skills/comments/`](skills/comments/SKILL.md) (with [adjudicated stance & schools](skills/comments/references/schools.md)): existence test for code comments, file preambles, and named laws.
-- [`skills/tests-review/`](skills/tests-review/SKILL.md) (with [adjudicated stance & schools](skills/tests-review/references/schools.md)): excuse-based test seating, workflow fusion, oracle collapse, and natural-layer QA.
-- Registered for automatic workspace discovery via [`.agents/skills.json`](.agents/skills.json).
+Enforced by three Minitest suites:
+- `BulkPaymentsIntegrationTest`: `201`/`422` contracts, threshold edges (`0/1/1000/1001`, `int4` cap, exact drain vs 1-cent-short rollback), `0`-SQL Layer 1 rejections, source-ordered `payment_ids`, and `500` redaction.
+- `LedgerInvariantsAndSecurityTest`: `ledger_runtime` ACLs and seeds, table constraints, superuser triggers, `READ COMMITTED` checks, bypassed-parser SQL safeguards, and conservation.
+- `ConcurrencyAndLockingTest`: 10-way sender contention, post-lock `READ COMMITTED` top-up visibility, and deadlock-free `A -> B` / `B -> A` transfers.

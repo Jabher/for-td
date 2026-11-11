@@ -3,118 +3,106 @@
 require "test_helper"
 
 class LedgerInvariantsAndSecurityTest < ActiveSupport::TestCase
-  test "runtime role can create firms with valid opening funds and update only firm name" do
+  test "ledger_runtime role permits firm creation and name updates while rejecting ungranted column, table, view, and DDL operations" do
     firm = create_firm!(name: "Original Name", opening_balance_cents: 25_000)
-    assert_equal "Original Name", firm.name
-    assert_equal 25_000, firm.opening_balance_cents
-    assert_equal 25_000, firm_balance_cents(firm.uuid)
-
+    other = create_firm!(name: "Counterparty", opening_balance_cents: 10_000)
     firm.update!(name: "Updated Firm Name")
+
     reloaded = FirmDescription.find(firm.id)
-    assert_equal "Updated Firm Name", reloaded.name
-    assert_equal 25_000, reloaded.opening_balance_cents
-
     view_row = Firm.find(firm.id)
-    assert_equal "Updated Firm Name", view_row.name
-    assert_equal 25_000, BigDecimal(view_row.balance_cents.to_s)
-  end
+    assert_equal(
+      {
+        table_row: [ "Updated Firm Name", 25_000 ],
+        view_row: [ "Updated Firm Name", 25_000 ]
+      },
+      {
+        table_row: [ reloaded.name, reloaded.opening_balance_cents ],
+        view_row: [ view_row.name, BigDecimal(view_row.balance_cents.to_s).to_i ]
+      }
+    )
 
-  test "runtime role cannot create firms with negative opening balance or blank name" do
     conn = ApplicationRecord.lease_connection
+    forbidden_operations = [
+      [ "update_opening_balance", "42501", -> { conn.exec_query("UPDATE public.firm_descriptions SET opening_balance_cents = 999999 WHERE id = $1", "ACL", [ firm.id ]) } ],
+      [ "update_uuid", "42501", -> { conn.exec_query("UPDATE public.firm_descriptions SET uuid = $1::uuid WHERE id = $2", "ACL", [ "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", firm.id ]) } ],
+      [ "update_id", "428C9", -> { conn.exec_query("UPDATE public.firm_descriptions SET id = 999 WHERE id = $1", "ACL", [ firm.id ]) } ],
+      [ "update_created_at", "42501", -> { conn.exec_query("UPDATE public.firm_descriptions SET created_at = NOW() WHERE id = $1", "ACL", [ firm.id ]) } ],
+      [ "delete_firm_descriptions", "42501", -> { conn.exec_query("DELETE FROM public.firm_descriptions WHERE id = $1", "ACL", [ firm.id ]) } ],
+      [ "select_payments", "42501", -> { conn.execute("SELECT * FROM public.payments") } ],
+      [ "insert_payments", "42501", -> { conn.execute("INSERT INTO public.payments (payer_firm_id, payee_firm_id, amount_cents, description) VALUES (#{firm.id}, #{other.id}, 100, 'Bypass')") } ],
+      [ "update_payments", "42501", -> { conn.execute("UPDATE public.payments SET amount_cents = 1") } ],
+      [ "delete_payments", "42501", -> { conn.execute("DELETE FROM public.payments") } ],
+      [ "truncate_payments", "42501", -> { conn.execute("TRUNCATE public.payments") } ],
+      [ "delete_firms_view", "42501", -> { conn.execute("DELETE FROM public.firms") } ],
+      [ "ddl_create_table", "42501", -> { conn.execute("CREATE TABLE public.rogue_table (id int)") } ],
+      [ "ddl_drop_view", "42501", -> { conn.execute("DROP VIEW public.firms") } ],
+      [ "ddl_alter_table", "42501", -> { conn.execute("ALTER TABLE public.firm_descriptions ADD COLUMN hacked boolean") } ]
+    ]
 
-    assert_raises(ActiveRecord::StatementInvalid) do
-      conn.exec_query(
-        "INSERT INTO public.firm_descriptions (name, opening_balance_cents) VALUES ($1, $2)",
-        "NegativeOpeningTest",
-        [ "Bad Firm", -1 ]
-      )
-    end
-
-    assert_raises(ActiveRecord::StatementInvalid) do
-      conn.exec_query(
-        "INSERT INTO public.firm_descriptions (name, opening_balance_cents) VALUES ($1, $2)",
-        "BlankNameTest",
-        [ "   \t\n  ", 0 ]
-      )
+    assert_table(forbidden_operations) do |label, expected_sqlstate, action|
+      [ label, expected_sqlstate, capture_pg_error(include_target: false, &action) ]
     end
   end
 
-  test "runtime role is strictly forbidden from updating immutable firm columns, deleting firms, touching payments directly, or altering schema" do
+  test "table CHECK, UNIQUE, and RESTRICT FOREIGN KEY constraints guard firm_descriptions and payments directly" do
     firm1 = create_firm!(name: "Firm One", opening_balance_cents: 50_000)
     firm2 = create_firm!(name: "Firm Two", opening_balance_cents: 10_000)
     conn = ApplicationRecord.lease_connection
 
-    err_opening = assert_raises(ActiveRecord::StatementInvalid) do
-      conn.exec_query(
-        "UPDATE public.firm_descriptions SET opening_balance_cents = 999999 WHERE id = $1",
-        "UpdateOpeningDenied",
-        [ firm1.id ]
-      )
-    end
-    assert_kind_of PG::InsufficientPrivilege, err_opening.cause
+    constraint_cases = [
+      [
+        "negative_opening_balance",
+        [ "23514", "chk_firm_descriptions_opening_balance_non_negative" ],
+        -> { conn.exec_query("INSERT INTO public.firm_descriptions (name, opening_balance_cents) VALUES ($1, $2)", "Chk", [ "Bad Firm", -1 ]) }
+      ],
+      [
+        "blank_firm_name",
+        [ "23514", "chk_firm_descriptions_name_not_blank" ],
+        -> { conn.exec_query("INSERT INTO public.firm_descriptions (name, opening_balance_cents) VALUES ($1, $2)", "Chk", [ "   \t\r\n  ", 0 ]) }
+      ],
+      [
+        "duplicate_firm_uuid",
+        [ "23505", "idx_firm_descriptions_uuid_covering" ],
+        -> { conn.exec_query("INSERT INTO public.firm_descriptions (uuid, name, opening_balance_cents) VALUES ($1::uuid, $2, $3)", "Uniq", [ firm1.uuid, "Dup UUID", 0 ]) }
+      ],
+      [
+        "zero_payment_amount",
+        [ "23514", "chk_payments_positive_amount" ],
+        -> { admin_connection.exec_params("INSERT INTO public.payments (payer_firm_id, payee_firm_id, amount_cents, description) VALUES ($1, $2, 0, 'Zero')", [ firm1.id, firm2.id ]) }
+      ],
+      [
+        "negative_payment_amount",
+        [ "23514", "chk_payments_positive_amount" ],
+        -> { admin_connection.exec_params("INSERT INTO public.payments (payer_firm_id, payee_firm_id, amount_cents, description) VALUES ($1, $2, -10, 'Neg')", [ firm1.id, firm2.id ]) }
+      ],
+      [
+        "self_transfer_row",
+        [ "23514", "chk_payments_no_self_transfer" ],
+        -> { admin_connection.exec_params("INSERT INTO public.payments (payer_firm_id, payee_firm_id, amount_cents, description) VALUES ($1, $1, 100, 'Self')", [ firm1.id ]) }
+      ],
+      [
+        "blank_payment_description",
+        [ "23514", "chk_payments_description_not_blank" ],
+        -> { admin_connection.exec_params("INSERT INTO public.payments (payer_firm_id, payee_firm_id, amount_cents, description) VALUES ($1, $2, 100, E' \\t\\r\\n')", [ firm1.id, firm2.id ]) }
+      ],
+      [
+        "missing_payer_fk",
+        [ "23503", "fk_payments_payer_firm" ],
+        -> { admin_connection.exec_params("INSERT INTO public.payments (payer_firm_id, payee_firm_id, amount_cents, description) VALUES ($1, $2, 100, 'Missing payer')", [ 999_999, firm2.id ]) }
+      ],
+      [
+        "missing_payee_fk",
+        [ "23503", "fk_payments_payee_firm" ],
+        -> { admin_connection.exec_params("INSERT INTO public.payments (payer_firm_id, payee_firm_id, amount_cents, description) VALUES ($1, $2, 100, 'Missing payee')", [ firm1.id, 999_999 ]) }
+      ]
+    ]
 
-    err_uuid = assert_raises(ActiveRecord::StatementInvalid) do
-      conn.exec_query(
-        "UPDATE public.firm_descriptions SET uuid = $1::uuid WHERE id = $2",
-        "UpdateUuidDenied",
-        [ "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", firm1.id ]
-      )
-    end
-    assert_kind_of PG::InsufficientPrivilege, err_uuid.cause
-
-    err_id = assert_raises(ActiveRecord::StatementInvalid) do
-      conn.exec_query(
-        "UPDATE public.firm_descriptions OVERRIDING SYSTEM VALUE SET id = 999 WHERE id = $1",
-        "UpdateIdDenied",
-        [ firm1.id ]
-      )
-    end
-    assert_includes [ PG::InsufficientPrivilege, PG::GeneratedAlways, PG::SyntaxError ], err_id.cause.class
-
-    err_created_at = assert_raises(ActiveRecord::StatementInvalid) do
-      conn.exec_query(
-        "UPDATE public.firm_descriptions SET created_at = NOW() WHERE id = $1",
-        "UpdateCreatedAtDenied",
-        [ firm1.id ]
-      )
-    end
-    assert_kind_of PG::InsufficientPrivilege, err_created_at.cause
-
-    err_del_firm = assert_raises(ActiveRecord::StatementInvalid) do
-      conn.exec_query("DELETE FROM public.firm_descriptions WHERE id = $1", "DeleteFirmDenied", [ firm1.id ])
-    end
-    assert_kind_of PG::InsufficientPrivilege, err_del_firm.cause
-
-    [
-      "SELECT * FROM public.payments",
-      "INSERT INTO public.payments (payer_firm_id, payee_firm_id, amount_cents, description) VALUES (#{firm1.id}, #{firm2.id}, 100, 'Bypass')",
-      "UPDATE public.payments SET amount_cents = 1",
-      "DELETE FROM public.payments",
-      "TRUNCATE public.payments"
-    ].each do |forbidden_sql|
-      err = assert_raises(ActiveRecord::StatementInvalid, "Expected InsufficientPrivilege for: #{forbidden_sql}") do
-        conn.execute(forbidden_sql)
-      end
-      assert_kind_of PG::InsufficientPrivilege, err.cause
-    end
-
-    assert_raises(ActiveRecord::StatementInvalid) do
-      conn.execute("DELETE FROM public.firms")
-    end
-
-    [
-      "CREATE TABLE public.rogue_table (id int)",
-      "DROP VIEW public.firms",
-      "ALTER TABLE public.firm_descriptions ADD COLUMN hacked boolean"
-    ].each do |ddl_sql|
-      err = assert_raises(ActiveRecord::StatementInvalid, "Expected privilege error for DDL: #{ddl_sql}") do
-        conn.execute(ddl_sql)
-      end
-      assert_kind_of PG::Error, err.cause
+    assert_table(constraint_cases) do |label, expected, action|
+      [ label, expected, capture_pg_error(&action) ]
     end
   end
 
-  test "immutability triggers block updates/deletes on payments and immutable firm columns even for privileged roles" do
+  test "immutability triggers block updates, deletes, and truncates on payments and immutable firm columns even for superuser/admin roles" do
     payer = create_firm!(name: "Payer", opening_balance_cents: 5_000)
     payee = create_firm!(name: "Payee", opening_balance_cents: 0)
 
@@ -126,35 +114,26 @@ class LedgerInvariantsAndSecurityTest < ActiveSupport::TestCase
         descriptions: [ "Immutable payment" ]
       )
     )
+    payment_id = fetch_all_payments.first.fetch(:id)
 
-    payment_id = fetch_all_payments.first[:id]
+    privileged_mutations = [
+      [ "update_payment_amount", [ "55000", "payment_immutable" ], -> { admin_connection.exec_params("UPDATE public.payments SET amount_cents = 1 WHERE id = $1", [ payment_id ]) } ],
+      [ "update_payment_description", [ "55000", "payment_immutable" ], -> { admin_connection.exec_params("UPDATE public.payments SET description = 'Tampered' WHERE id = $1", [ payment_id ]) } ],
+      [ "delete_payment", [ "55000", "payment_immutable" ], -> { admin_connection.exec_params("DELETE FROM public.payments WHERE id = $1", [ payment_id ]) } ],
+      [ "truncate_payments", [ "55000", "payment_immutable" ], -> { admin_connection.exec("TRUNCATE public.payments") } ],
+      [ "update_firm_opening_balance", [ "55000", "firm_immutable_columns" ], -> { admin_connection.exec_params("UPDATE public.firm_descriptions SET opening_balance_cents = 999999 WHERE id = $1", [ payer.id ]) } ],
+      [ "update_firm_uuid", [ "55000", "firm_immutable_columns" ], -> { admin_connection.exec_params("UPDATE public.firm_descriptions SET uuid = pg_catalog.uuidv7() WHERE id = $1", [ payer.id ]) } ],
+      [ "update_firm_created_at", [ "55000", "firm_immutable_columns" ], -> { admin_connection.exec_params("UPDATE public.firm_descriptions SET created_at = NOW() - INTERVAL '1 day' WHERE id = $1", [ payer.id ]) } ],
+      [ "delete_firm", [ "55000", "firm_immutable" ], -> { admin_connection.exec_params("DELETE FROM public.firm_descriptions WHERE id = $1", [ payee.id ]) } ],
+      [ "truncate_firms", [ "55000", "firm_immutable" ], -> { admin_connection.exec("TRUNCATE public.firm_descriptions CASCADE") } ]
+    ]
 
-    assert_raises(PG::ObjectNotInPrerequisiteState) do
-      admin_connection.exec_params("UPDATE public.payments SET amount_cents = 1 WHERE id = $1", [ payment_id ])
-    end
-
-    assert_raises(PG::ObjectNotInPrerequisiteState) do
-      admin_connection.exec_params("UPDATE public.payments SET description = 'Tampered' WHERE id = $1", [ payment_id ])
-    end
-
-    assert_raises(PG::ObjectNotInPrerequisiteState) do
-      admin_connection.exec_params("DELETE FROM public.payments WHERE id = $1", [ payment_id ])
-    end
-
-    assert_raises(PG::ObjectNotInPrerequisiteState) do
-      admin_connection.exec("TRUNCATE public.payments")
-    end
-
-    assert_raises(PG::ObjectNotInPrerequisiteState) do
-      admin_connection.exec_params("UPDATE public.firm_descriptions SET opening_balance_cents = 999999 WHERE id = $1", [ payer.id ])
-    end
-
-    assert_raises(PG::ObjectNotInPrerequisiteState) do
-      admin_connection.exec_params("DELETE FROM public.firm_descriptions WHERE id = $1", [ payee.id ])
+    assert_table(privileged_mutations) do |label, expected, action|
+      [ label, expected, capture_pg_error(&action) ]
     end
   end
 
-  test "post_bulk_payments is VOLATILE, SECURITY DEFINER, and rejects REPEATABLE READ, SERIALIZABLE, and READ ONLY transactions" do
+  test "post_bulk_payments enforces VOLATILE SECURITY DEFINER metadata and rejects non-READ COMMITTED or READ ONLY transactions" do
     fn_meta = admin_connection.exec(<<~SQL).first
       SELECT p.provolatile, p.prosecdef, pg_catalog.pg_get_userbyid(p.proowner) AS owner_name, p.proconfig
       FROM pg_catalog.pg_proc p
@@ -162,99 +141,120 @@ class LedgerInvariantsAndSecurityTest < ActiveSupport::TestCase
       WHERE n.nspname = 'public' AND p.proname = 'post_bulk_payments'
     SQL
 
-    assert_equal "v", fn_meta["provolatile"], "Function must be VOLATILE"
-    assert_equal "t", fn_meta["prosecdef"], "Function must be SECURITY DEFINER"
-    assert_equal "ledger_definer", fn_meta["owner_name"], "Function must be owned by dedicated definer role"
-    assert_includes fn_meta["proconfig"].to_s, "search_path=pg_catalog, pg_temp"
+    assert_equal(
+      {
+        provolatile: "v",
+        prosecdef: "t",
+        owner_name: "ledger_definer",
+        proconfig: "{\"search_path=pg_catalog, pg_temp\"}"
+      },
+      {
+        provolatile: fn_meta["provolatile"],
+        prosecdef: fn_meta["prosecdef"],
+        owner_name: fn_meta["owner_name"],
+        proconfig: fn_meta["proconfig"]
+      }
+    )
 
     payer = create_firm!(name: "Iso Payer", opening_balance_cents: 10_000)
     payee = create_firm!(name: "Iso Payee", opening_balance_cents: 0)
     conn = ApplicationRecord.lease_connection
+    post_sql = "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[100]::int4[], ARRAY['Test']::text[])"
 
-    %i[repeatable_read serializable].each do |bad_isolation|
-      err = assert_raises(ActiveRecord::StatementInvalid) do
-        conn.transaction(isolation: bad_isolation, joinable: false) do
-          conn.exec_query(
-            "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[100]::int4[], ARRAY['Test']::text[])",
-            "BadIsolationTest",
-            [ payer.uuid, payee.uuid ]
-          )
+    tx_modes = [
+      [
+        "repeatable_read",
+        [ "25001", "invalid_transaction_isolation" ],
+        -> { conn.transaction(isolation: :repeatable_read, joinable: false) { conn.exec_query(post_sql, "IsoTest", [ payer.uuid, payee.uuid ]) } }
+      ],
+      [
+        "serializable",
+        [ "25001", "invalid_transaction_isolation" ],
+        -> { conn.transaction(isolation: :serializable, joinable: false) { conn.exec_query(post_sql, "IsoTest", [ payer.uuid, payee.uuid ]) } }
+      ],
+      [
+        "read_only",
+        [ "25006", "read_only_transaction" ],
+        lambda do
+          conn.transaction(isolation: :read_committed, joinable: false) do
+            conn.execute("SET LOCAL transaction_read_only = on")
+            conn.exec_query(post_sql, "ReadOnlyTest", [ payer.uuid, payee.uuid ])
+          end
         end
-      end
-      assert_equal "25001", err.cause.result.error_field(PG::Result::PG_DIAG_SQLSTATE)
-      assert_equal "invalid_transaction_isolation", err.cause.result.error_field(PG::Result::PG_DIAG_MESSAGE_DETAIL)
-    end
+      ]
+    ]
 
-    err_ro = assert_raises(ActiveRecord::StatementInvalid) do
-      conn.transaction(isolation: :read_committed, joinable: false) do
-        conn.execute("SET LOCAL transaction_read_only = on")
-        conn.exec_query(
-          "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[100]::int4[], ARRAY['Test']::text[])",
-          "ReadOnlyTest",
-          [ payer.uuid, payee.uuid ]
-        )
-      end
+    assert_table(tx_modes) do |label, expected, action|
+      [ label, expected, capture_pg_error(&action) ]
     end
-    assert_equal "25006", err_ro.cause.result.error_field(PG::Result::PG_DIAG_SQLSTATE)
-    assert_equal "read_only_transaction", err_ro.cause.result.error_field(PG::Result::PG_DIAG_MESSAGE_DETAIL)
-
-    assert_empty fetch_all_payments
   end
 
-  test "post_bulk_payments validates its own SQL arguments directly when called outside Rails HTTP validation" do
+  test "Layer 2 SQL safeguards reject invalid direct arguments and translate into BulkPayments::Error doors when Layer 1 is bypassed" do
     payer = create_firm!(name: "Arg Payer", opening_balance_cents: 50_000)
     payee = create_firm!(name: "Arg Payee", opening_balance_cents: 0)
     conn = ApplicationRecord.lease_connection
 
     invalid_sql_calls = [
-      [ "SELECT public.post_bulk_payments(NULL::uuid, ARRAY[$1::uuid], ARRAY[100]::int4[], ARRAY['ok']::text[])", [ payee.uuid ], "null_payer_firm_uuid" ],
-      [ "SELECT public.post_bulk_payments($1::uuid, NULL::uuid[], ARRAY[100]::int4[], ARRAY['ok']::text[])", [ payer.uuid ], "null_payment_arrays" ],
-      [ "SELECT public.post_bulk_payments($1::uuid, ARRAY[]::uuid[], ARRAY[]::int4[], ARRAY[]::text[])", [ payer.uuid ], "invalid_batch_size" ],
-      [ "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[100, 200]::int4[], ARRAY['ok']::text[])", [ payer.uuid, payee.uuid ], "mismatched_array_lengths" ],
-      [ "SELECT public.post_bulk_payments($1::uuid, ARRAY[[$2::uuid]], ARRAY[[100]]::int4[], ARRAY[['ok']]::text[])", [ payer.uuid, payee.uuid ], "invalid_array_dimensions" ],
-      [ "SELECT public.post_bulk_payments($1::uuid, ('[2:2]={' || $2::text || '}')::uuid[], ARRAY[100]::int4[], ARRAY['ok']::text[])", [ payer.uuid, payee.uuid ], "invalid_array_dimensions" ],
-      [ "SELECT public.post_bulk_payments($1::uuid, ARRAY[NULL::uuid], ARRAY[100]::int4[], ARRAY['ok']::text[])", [ payer.uuid ], "null_payee_firm_uuid" ],
-      [ "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[0]::int4[], ARRAY['ok']::text[])", [ payer.uuid, payee.uuid ], "invalid_amount_cents" ],
-      [ "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[-50]::int4[], ARRAY['ok']::text[])", [ payer.uuid, payee.uuid ], "invalid_amount_cents" ],
-      [ "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[NULL::int4], ARRAY['ok']::text[])", [ payer.uuid, payee.uuid ], "invalid_amount_cents" ],
-      [ "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[100]::int4[], ARRAY['   ']::text[])", [ payer.uuid, payee.uuid ], "blank_description" ],
-      [ "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[100]::int4[], ARRAY[NULL::text])", [ payer.uuid, payee.uuid ], "blank_description" ],
-      [ "SELECT public.post_bulk_payments($1::uuid, ARRAY[$1::uuid], ARRAY[100]::int4[], ARRAY['Self']::text[])", [ payer.uuid ], "self_payment" ]
+      [ "null_payer", [ "22004", "null_payer_firm_uuid" ], "SELECT public.post_bulk_payments(NULL::uuid, ARRAY[$1::uuid], ARRAY[100]::int4[], ARRAY['ok']::text[])", [ payee.uuid ] ],
+      [ "null_arrays", [ "22004", "null_payment_arrays" ], "SELECT public.post_bulk_payments($1::uuid, NULL::uuid[], ARRAY[100]::int4[], ARRAY['ok']::text[])", [ payer.uuid ] ],
+      [ "empty_arrays", [ "22023", "invalid_batch_size" ], "SELECT public.post_bulk_payments($1::uuid, ARRAY[]::uuid[], ARRAY[]::int4[], ARRAY[]::text[])", [ payer.uuid ] ],
+      [ "oversized_1001", [ "22023", "invalid_batch_size" ], "SELECT public.post_bulk_payments($1::uuid, array_fill($2::uuid, ARRAY[1001]), array_fill(1::int4, ARRAY[1001]), array_fill('ok'::text, ARRAY[1001]))", [ payer.uuid, payee.uuid ] ],
+      [ "mismatched_lengths", [ "2202E", "mismatched_array_lengths" ], "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[100, 200]::int4[], ARRAY['ok']::text[])", [ payer.uuid, payee.uuid ] ],
+      [ "two_dimensional", [ "2202E", "invalid_array_dimensions" ], "SELECT public.post_bulk_payments($1::uuid, ARRAY[[$2::uuid]], ARRAY[[100]]::int4[], ARRAY[['ok']]::text[])", [ payer.uuid, payee.uuid ] ],
+      [ "non_1_lower_bound", [ "2202E", "invalid_array_dimensions" ], "SELECT public.post_bulk_payments($1::uuid, ('[2:2]={' || $2::text || '}')::uuid[], ARRAY[100]::int4[], ARRAY['ok']::text[])", [ payer.uuid, payee.uuid ] ],
+      [ "null_payee_element", [ "22004", "null_payee_firm_uuid" ], "SELECT public.post_bulk_payments($1::uuid, ARRAY[NULL::uuid], ARRAY[100]::int4[], ARRAY['ok']::text[])", [ payer.uuid ] ],
+      [ "zero_amount", [ "22023", "invalid_amount_cents" ], "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[0]::int4[], ARRAY['ok']::text[])", [ payer.uuid, payee.uuid ] ],
+      [ "negative_amount", [ "22023", "invalid_amount_cents" ], "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[-50]::int4[], ARRAY['ok']::text[])", [ payer.uuid, payee.uuid ] ],
+      [ "null_amount_element", [ "22023", "invalid_amount_cents" ], "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[NULL::int4], ARRAY['ok']::text[])", [ payer.uuid, payee.uuid ] ],
+      [ "blank_description", [ "22023", "blank_description" ], "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[100]::int4[], ARRAY['   ']::text[])", [ payer.uuid, payee.uuid ] ],
+      [ "null_description_element", [ "22023", "blank_description" ], "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[100]::int4[], ARRAY[NULL::text])", [ payer.uuid, payee.uuid ] ],
+      [ "self_payment", [ "P0001", "self_payment" ], "SELECT public.post_bulk_payments($1::uuid, ARRAY[$1::uuid], ARRAY[100]::int4[], ARRAY['Self']::text[])", [ payer.uuid ] ]
     ]
 
-    invalid_sql_calls.each do |sql, binds, expected_detail|
-      err = assert_raises(ActiveRecord::StatementInvalid, "Expected failure (#{expected_detail}) for SQL: #{sql}") do
+    assert_table(invalid_sql_calls) do |label, expected, sql, binds|
+      actual = capture_pg_error do
         conn.transaction(isolation: :read_committed, joinable: false) do
-          conn.exec_query(sql, "DirectSqlArgTest", binds)
+          conn.exec_query(sql, "DirectSqlSafeguard", binds)
         end
       end
-      actual_detail = err.cause.result.error_field(PG::Result::PG_DIAG_MESSAGE_DETAIL)
-      assert_equal expected_detail, actual_detail, "Unexpected detail for #{sql}"
+      [ label, expected, actual ]
     end
 
-    assert_empty fetch_all_payments
-  end
+    bypassed_batches = [
+      [
+        "poster_self_payment",
+        BulkPayments::PayloadParser::ParsedBatch.new(payer_firm_uuid: payer.uuid, payee_firm_uuids: [ payer.uuid ], amounts_cents: [ 500 ], descriptions: [ "Self" ]),
+        { code: "self_payment", field: "payments[0].payee_firm_uuid", payment_index: 0 }
+      ],
+      [
+        "poster_empty_batch",
+        BulkPayments::PayloadParser::ParsedBatch.new(payer_firm_uuid: payer.uuid, payee_firm_uuids: [], amounts_cents: [], descriptions: []),
+        { code: "invalid_batch_size", field: "payments" }
+      ],
+      [
+        "poster_non_positive_amount",
+        BulkPayments::PayloadParser::ParsedBatch.new(payer_firm_uuid: payer.uuid, payee_firm_uuids: [ payee.uuid ], amounts_cents: [ 0 ], descriptions: [ "Zero" ]),
+        { code: "invalid_amount", field: "payments", payment_index: 0 }
+      ],
+      [
+        "poster_blank_description",
+        BulkPayments::PayloadParser::ParsedBatch.new(payer_firm_uuid: payer.uuid, payee_firm_uuids: [ payee.uuid ], amounts_cents: [ 100 ], descriptions: [ "   " ]),
+        { code: "blank_description", field: "payments", payment_index: 0 }
+      ]
+    ]
 
-  test "Poster translates Layer 2 PostgreSQL safeguard rejections into BulkPayments::Error doors when Layer 1 is bypassed" do
-    payer = create_firm!(name: "Safeguard Payer", opening_balance_cents: 50_000)
-    bypassed_batch = BulkPayments::PayloadParser::ParsedBatch.new(
-      payer_firm_uuid: payer.uuid,
-      payee_firm_uuids: [ payer.uuid ],
-      amounts_cents: [ 500 ],
-      descriptions: [ "Direct Poster call bypassing PayloadParser" ]
-    )
-
-    err = assert_raises(BulkPayments::Error) do
-      BulkPayments::Poster.call(bypassed_batch)
+    assert_table(bypassed_batches) do |label, batch, expected|
+      actual = begin
+        BulkPayments::Poster.call(batch)
+        :no_error
+      rescue BulkPayments::Error => e
+        { code: e.code, field: e.field, payment_index: e.payment_index }.compact
+      end
+      [ label, expected, actual ]
     end
-
-    assert_equal "self_payment", err.code
-    assert_equal "payments[0].payee_firm_uuid", err.field
-    assert_equal 0, err.payment_index
-    assert_empty fetch_all_payments
   end
 
-  test "verifies global accounting conservation invariants across multi-party transfers" do
+  test "preserves global double-entry conservation and trigger purity across multi-party transfers" do
     firms = Array.new(5) { |i| create_firm!(name: "Firm #{i}", opening_balance_cents: 100_000 * (i + 1)) }
     total_opening = firms.sum(&:opening_balance_cents)
 
@@ -277,39 +277,42 @@ class LedgerInvariantsAndSecurityTest < ActiveSupport::TestCase
     end
 
     all_payments = fetch_all_payments
-
-    # Invariant 1: For each sender, total outgoing equals total recipient credits originating from that sender.
-    firms.each do |sender|
-      outgoing_from_sender = all_payments.select { |p| p[:payer_firm_id] == sender.id }.sum { |p| p[:amount_cents] }
-      credits_from_sender = admin_connection.exec_params(
-        "SELECT COALESCE(SUM(amount_cents::numeric), 0) AS s FROM public.payments WHERE payer_firm_id = $1",
-        [ sender.id ]
-      ).first["s"].to_i
-      assert_equal outgoing_from_sender, credits_from_sender
-    end
-
-    # Invariant 2: Raw history + opening funds reproduces every firm's view balance,
-    # and global sum of derived balances equals global sum of opening funds.
-    sum_of_derived_balances = 0
-    firms.each do |firm|
+    reconstructed_balances = firms.to_h do |firm|
       incoming = all_payments.select { |p| p[:payee_firm_id] == firm.id }.sum { |p| p[:amount_cents] }
       outgoing = all_payments.select { |p| p[:payer_firm_id] == firm.id }.sum { |p| p[:amount_cents] }
-      expected_balance = firm.opening_balance_cents + incoming - outgoing
-      actual_balance = firm_balance_cents(firm.id).to_i
+      [ firm.id, firm.opening_balance_cents + incoming - outgoing ]
+    end
+    view_balances = firms.to_h { |firm| [ firm.id, firm_balance_cents(firm.id) ] }
 
-      assert_equal expected_balance, actual_balance
-      sum_of_derived_balances += actual_balance
+    sender_conservation = firms.to_h do |sender|
+      ruby_outgoing = all_payments.select { |p| p[:payer_firm_id] == sender.id }.sum { |p| p[:amount_cents] }
+      recipient_credits_from_sender = admin_connection.exec_params(
+        "SELECT COALESCE(SUM(amount_cents::numeric), 0) AS s FROM public.payments WHERE payer_firm_id = $1 AND payee_firm_id IS NOT NULL",
+        [ sender.id ]
+      ).first["s"].to_i
+      [ sender.id, ruby_outgoing == recipient_credits_from_sender ]
     end
 
-    assert_equal total_opening, sum_of_derived_balances
-
-    # Invariant 3: Only immutability guard triggers exist on `payments` (zero hidden balance-snapshot triggers).
-    triggers = admin_connection.exec(<<~SQL).map { |r| r["tgname"] }
+    payment_triggers = admin_connection.exec(<<~SQL).map { |r| r["tgname"] }
       SELECT tgname
       FROM pg_catalog.pg_trigger
       WHERE tgrelid = 'public.payments'::regclass AND NOT tgisinternal
       ORDER BY tgname
     SQL
-    assert_equal %w[trg_payments_immutability trg_payments_no_truncate], triggers
+
+    assert_equal(
+      {
+        sender_debits_equal_recipient_credits: firms.to_h { |f| [ f.id, true ] },
+        view_balances: reconstructed_balances,
+        global_sum: total_opening,
+        payment_triggers: %w[trg_payments_immutability trg_payments_no_truncate]
+      },
+      {
+        sender_debits_equal_recipient_credits: sender_conservation,
+        view_balances: view_balances,
+        global_sum: view_balances.values.sum,
+        payment_triggers: payment_triggers
+      }
+    )
   end
 end

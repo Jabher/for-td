@@ -84,4 +84,5 @@ Every `422` response returns a stable JSON structure explaining **what** failed,
 
 - [`skills/errors-as-doors/`](skills/errors-as-doors/SKILL.md) (with [cross-domain research consolidation](skills/errors-as-doors/references/errors-as-doors-cross-domain-2026-05-30.md)): educational boundary rejection design (`fact -> reason -> action` doors).
 - [`skills/comments/`](skills/comments/SKILL.md) (with [adjudicated stance & schools](skills/comments/references/schools.md)): existence test for code comments, file preambles, and named laws.
+- [`skills/tests-review/`](skills/tests-review/SKILL.md) (with [adjudicated stance & schools](skills/tests-review/references/schools.md)): excuse-based test seating, workflow fusion, oracle collapse, and natural-layer QA.
 - Registered for automatic workspace discovery via [`.agents/skills.json`](.agents/skills.json).

@@ -60,8 +60,8 @@ module BulkPayments
       }
     }.freeze
 
-    def self.call(parsed_batch, connection: ApplicationRecord.lease_connection)
-      new(connection).call(parsed_batch)
+    def self.call(parsed_batch)
+      new(ApplicationRecord.lease_connection).call(parsed_batch)
     end
 
     def initialize(connection)

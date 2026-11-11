@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 ENV["RAILS_ENV"] ||= "test"
 require_relative "../config/environment"
 require "rails/test_help"
@@ -17,7 +19,7 @@ module LedgerTestHelpers
         dbname: cfg[:database],
         user: cfg[:username],
         password: cfg[:password]
-      )
+      ).tap { |c| c.set_notice_processor { } }
     end
   end
 
@@ -46,21 +48,17 @@ module LedgerTestHelpers
   end
 
   def firm_balance_cents(uuid_or_id)
-    firm = if uuid_or_id.is_a?(Integer)
-      Firm.find(uuid_or_id)
-    else
-      Firm.find_by!(uuid: uuid_or_id)
-    end
-    BigDecimal(firm.balance_cents.to_s)
+    firm = uuid_or_id.is_a?(Integer) ? Firm.find(uuid_or_id) : Firm.find_by!(uuid: uuid_or_id)
+    decimal = BigDecimal(firm.balance_cents.to_s)
+    decimal.frac.zero? ? decimal.to_i : decimal
   end
 
   def fetch_all_payments
-    res = admin_connection.exec(<<~SQL)
+    admin_connection.exec(<<~SQL).map do |row|
       SELECT id, payer_firm_id, payee_firm_id, amount_cents, description, created_at
       FROM public.payments
       ORDER BY id ASC
     SQL
-    res.map do |row|
       {
         id: row["id"].to_i,
         payer_firm_id: row["payer_firm_id"].to_i,
@@ -71,6 +69,51 @@ module LedgerTestHelpers
       }
     end
   end
+
+  def count_sql_queries
+    queries = 0
+    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") { queries += 1 }
+    result = yield
+    [ result, queries ]
+  ensure
+    ActiveSupport::Notifications.unsubscribe(subscriber) if subscriber
+  end
+
+  def assert_table(rows)
+    failures = rows.filter_map.with_index do |row, idx|
+      label, expected, actual = yield(row)
+      next if expected == actual
+
+      "[row #{idx} #{label}] expected #{expected.inspect}, got #{actual.inspect}"
+    rescue StandardError => e
+      "[row #{idx} #{row.inspect}] unexpected #{e.class}: #{e.message}"
+    end
+
+    assert_empty failures, failures.join("\n")
+  end
+
+  def capture_pg_error(include_target: true)
+    yield
+    :no_error
+  rescue ActiveRecord::StatementInvalid => e
+    extract_pg_diag(e.cause, include_target: include_target)
+  rescue PG::Error => e
+    extract_pg_diag(e, include_target: include_target)
+  end
+
+  private
+
+    def extract_pg_diag(pg_error, include_target:)
+      return pg_error.class.name unless pg_error.is_a?(PG::Error) && pg_error.result
+
+      res = pg_error.result
+      sqlstate = res.error_field(PG::Result::PG_DIAG_SQLSTATE)
+      return sqlstate unless include_target
+
+      target = res.error_field(PG::Result::PG_DIAG_CONSTRAINT_NAME) ||
+               res.error_field(PG::Result::PG_DIAG_MESSAGE_DETAIL)
+      [ sqlstate, target ]
+    end
 end
 
 module ActiveSupport

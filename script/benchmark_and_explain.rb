@@ -288,7 +288,7 @@ begin
     wall = measure_seconds do
       workers = threads_count.times.map do |tid|
         Thread.new do
-          ActiveRecord::Base.connection_pool.with_connection do |conn|
+          ActiveRecord::Base.connection_pool.with_connection do
             batches_per_thread.times do |iter|
               sender_uuid = mode == :distinct_senders ? firms[200 + tid]["uuid"] : firms[300]["uuid"]
               raw_json = JSON.generate(
@@ -299,7 +299,7 @@ begin
               )
               t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
               parsed = BulkPayments::PayloadParser.parse(raw_json)
-              BulkPayments::Poster.call(parsed, connection: conn)
+              BulkPayments::Poster.call(parsed)
               dt = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1_000.0
               latencies_mutex.synchronize { all_latencies << dt }
             end

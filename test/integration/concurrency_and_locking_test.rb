@@ -3,11 +3,12 @@
 require "test_helper"
 
 class ConcurrencyAndLockingTest < ActiveSupport::TestCase
-  test "concurrent outgoing batches from the same sender serialize via FOR NO KEY UPDATE and never overdraft" do
-    # $100.00 (10,000 cents) opening balance vs 10 concurrent $30.00 (3,000 cents) debits ->
-    # floor(10,000 / 3,000) = 3 commits (9,000 cents spent, 1,000 remaining) and 7 `insufficient_funds`.
-    payer = create_firm!(name: "Concurrent Sender", opening_balance_cents: 10_000)
-    payee = create_firm!(name: "Concurrent Recipient", opening_balance_cents: 0)
+  test "concurrent multi-leg outgoing batches from the same sender serialize via FOR NO KEY UPDATE without overdraft or partial writes" do
+    # 10,000 cents opening balance vs 10 concurrent 2-leg batches (2,000 + 1,000 = 3,000 cents each) ->
+    # floor(10,000 / 3,000) = 3 commits (6 payment rows, 9,000 spent, 1,000 remaining) and 7 `insufficient_funds`.
+    payer  = create_firm!(name: "Concurrent Sender", opening_balance_cents: 10_000)
+    payee1 = create_firm!(name: "Concurrent Recipient 1", opening_balance_cents: 0)
+    payee2 = create_firm!(name: "Concurrent Recipient 2", opening_balance_cents: 0)
 
     worker_count = 10
     barrier = Queue.new
@@ -23,8 +24,8 @@ class ConcurrencyAndLockingTest < ActiveSupport::TestCase
 
           conn.exec("BEGIN ISOLATION LEVEL READ COMMITTED")
           conn.exec_params(
-            "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[$3::int4], ARRAY[$4::text])",
-            [ payer.uuid, payee.uuid, 3_000, "Concurrent transfer #{i}" ]
+            "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid, $3::uuid], ARRAY[2000, 1000]::int4[], ARRAY[$4::text, $5::text])",
+            [ payer.uuid, payee1.uuid, payee2.uuid, "Race #{i} leg A", "Race #{i} leg B" ]
           )
           conn.exec("COMMIT")
           results[i] = :committed
@@ -41,11 +42,24 @@ class ConcurrencyAndLockingTest < ActiveSupport::TestCase
     worker_count.times { barrier << true }
     threads.each(&:join)
 
-    assert_equal 3, results.count(:committed)
-    assert_equal 7, results.count(:insufficient_funds)
-    assert_equal 1_000, firm_balance_cents(payer.uuid)
-    assert_equal 9_000, firm_balance_cents(payee.uuid)
-    assert_equal 3, fetch_all_payments.size
+    assert_equal(
+      {
+        committed: 3,
+        insufficient_funds: 7,
+        stored_rows: 6,
+        balances: { payer: 1_000, payee1: 6_000, payee2: 3_000 }
+      },
+      {
+        committed: results.count(:committed),
+        insufficient_funds: results.count(:insufficient_funds),
+        stored_rows: fetch_all_payments.size,
+        balances: {
+          payer: firm_balance_cents(payer.uuid),
+          payee1: firm_balance_cents(payee1.uuid),
+          payee2: firm_balance_cents(payee2.uuid)
+        }
+      }
+    )
   end
 
   test "lock-then-balance under READ COMMITTED sees newly committed funds after waiting on sender lock" do
@@ -72,15 +86,12 @@ class ConcurrencyAndLockingTest < ActiveSupport::TestCase
         "SELECT public.post_bulk_payments($1::uuid, ARRAY[$2::uuid], ARRAY[4000]::int4[], ARRAY['Tx1 spend']::text[])",
         [ payer.uuid, payee.uuid ]
       )
-      conn1_pid = conn1.backend_pid
 
       held_locks = admin_connection.exec_params(
         "SELECT mode FROM pg_locks WHERE pid = $1 AND relation = 'public.firm_descriptions'::regclass AND granted",
-        [ conn1_pid ]
+        [ conn1.backend_pid ]
       ).map { |r| r["mode"] }
-      assert_includes held_locks, "RowShareLock"
 
-      conn2_pid = conn2.backend_pid
       tx2_thread = Thread.new do
         conn2.exec("BEGIN ISOLATION LEVEL READ COMMITTED")
         conn2.exec_params(
@@ -91,7 +102,7 @@ class ConcurrencyAndLockingTest < ActiveSupport::TestCase
         tx2_result = :committed
       end
 
-      wait_until_backend_waiting_on_lock!(conn2_pid)
+      wait_until_backend_waiting_on_lock!(conn2.backend_pid)
 
       conn3.exec("BEGIN ISOLATION LEVEL READ COMMITTED")
       conn3.exec_params(
@@ -103,10 +114,22 @@ class ConcurrencyAndLockingTest < ActiveSupport::TestCase
       conn1.exec("COMMIT")
       tx2_thread.join(5)
 
-      assert_equal :committed, tx2_result
-      assert_equal 500, firm_balance_cents(payer.uuid)
-      assert_equal 8_000, firm_balance_cents(payee.uuid)
-      assert_equal 6_500, firm_balance_cents(funder.uuid)
+      assert_equal(
+        {
+          sender_row_share_locked: true,
+          tx2_result: :committed,
+          balances: { payer: 500, payee: 8_000, funder: 6_500 }
+        },
+        {
+          sender_row_share_locked: held_locks.include?("RowShareLock"),
+          tx2_result: tx2_result,
+          balances: {
+            payer: firm_balance_cents(payer.uuid),
+            payee: firm_balance_cents(payee.uuid),
+            funder: firm_balance_cents(funder.uuid)
+          }
+        }
+      )
     ensure
       conn1&.close
       conn2&.close
@@ -136,11 +159,16 @@ class ConcurrencyAndLockingTest < ActiveSupport::TestCase
         [ firm_b.uuid, firm_a.uuid ]
       )
       conn_b.exec("COMMIT")
-
       conn_a.exec("COMMIT")
 
-      assert_equal 11_500, firm_balance_cents(firm_a.uuid)
-      assert_equal 8_500, firm_balance_cents(firm_b.uuid)
+      assert_equal(
+        { firm_a: 11_500, firm_b: 8_500, stored_rows: 2 },
+        {
+          firm_a: firm_balance_cents(firm_a.uuid),
+          firm_b: firm_balance_cents(firm_b.uuid),
+          stored_rows: fetch_all_payments.size
+        }
+      )
     ensure
       conn_a&.close
       conn_b&.close
